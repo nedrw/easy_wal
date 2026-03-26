@@ -6,7 +6,7 @@
 //!
 //! 项目采用四层架构：
 //! - Layer 1: 存储层 (`storage`) - 底层存储抽象
-//! - Layer 2: 组件层 - 核心功能组件（未来实现）
+//! - Layer 2: 组件层 - 核心功能组件（当前实现）
 //! - Layer 3: 协调层 - 生命周期管理（未来实现）
 //! - Layer 4: API 层 - 用户接口（未来实现）
 //!
@@ -20,11 +20,10 @@
 //!
 //! # 当前状态
 //!
-//! Phase 1: 存储层重构 (进行中)
-//! - ✅ Storage trait 设计
-//! - ✅ FileStorage 实现
-//! - ✅ MemoryStorage 实现
-//! - ⬜ 测试完善
+//! Phase 2: 文件管理 (已完成)
+//! - ✅ SegmentManager 实现
+//! - ✅ LogWriter 集成
+//! - ✅ 配置和测试
 
 mod error;
 mod prelude;
@@ -32,4 +31,7 @@ pub mod storage;
 
 // 重导出常用类型，方便用户使用
 pub use prelude::{Error, Result};
-pub use storage::{FileStorage, Location, MemoryStorage, Storage, StorageStats};
+pub use storage::{
+    FileStorage, Location, LogWriter, LogWriterConfig, MemoryStorage, SegmentConfig,
+    SegmentManager, SegmentMeta, Storage, StorageStats, WritePosition,
+};

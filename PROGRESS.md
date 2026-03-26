@@ -15,7 +15,7 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
 
 ## 📊 阶段进度
 
-### ✅ Phase 1: 存储层重构（当前阶段）
+### ✅ Phase 1: 存储层重构
 **目标**: 建立清晰的存储抽象，数据一致性保证
 
 **任务**:
@@ -31,15 +31,15 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
 
 ---
 
-### ⬜ Phase 2: 文件管理（段管理）
+### ✅ Phase 2: 文件管理（段管理）
 **目标**: 实现多文件轮转
 
 **任务**:
-- ⬜ 实现 SegmentManager
-- ⬜ 集成到 LogWriter
-- ⬜ 添加配置和测试
+- ✅ 实现 SegmentManager
+- ✅ 集成到 LogWriter
+- ✅ 添加配置和测试
 
-**产出**: v0.2.0 - 支持文件轮转
+**产出**: v0.2.0 - 支持文件轮转 ✅
 
 ---
 
