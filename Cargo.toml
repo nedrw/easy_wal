@@ -8,11 +8,15 @@ thiserror = "2.0.17"
 log4rs = "1.4.0"
 serde = { version = "1.0.228", features = ["derive"] }
 tracing = "0.1.41"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+parking_lot = "0.12"
 
 [dev-dependencies]
 anyhow = "1.0.100"
 criterion = "0.7.0"
+tempfile = "3"
 
-[[bench]]
-name = "bench"
-harness = false
+# [[bench]]
+# name = "bench"
+# harness = false
