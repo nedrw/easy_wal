@@ -19,28 +19,29 @@
 
 ---
 
-### 2. SyncStrategy 未实际集成
+### 2. SyncStrategy 集成 ✅ 已完成
 
 **位置**: `src/wal/sync_strategy.rs`, `src/storage/log_writer.rs`, `src/wal/wal_manager.rs`
 
-**当前状态**: `SyncStrategy` 已在 `src/wal/` 完整实现（包含 None/FsyncOnWrite/Periodic/Batch 四种模式），但 `LogWriter` 仍使用简单 `bool sync_on_write`，`SyncStrategy` 未被任何组件使用。
+**状态**: 已完全集成
 
-**决策**: 保持现状（路径 A）
-- `LogWriter` 保持简单，仅使用 `sync_on_write: bool`
-- `SyncStrategy` 保留在 API 层，供上层应用自行使用（如需复杂策略，在调用方管理）
+**实现内容**:
+- `LogWriter` 现在使用 `SyncMode` 替代简单的 `bool sync_on_write`
+- 支持四种同步模式：None, FsyncOnWrite, Periodic(interval_ms), Batch(batch_size)
+- `WalConfig` 和 `WalBuilder` 新增 `with_sync_mode()` API
+- 保持向后兼容：`with_sync_on_write(true/false)` 自动映射到 FsyncOnWrite/None
+- `LogWriter` 新增 `sync_stats()` 和 `sync_mode()` 方法用于监控
 
-**原因**: 
-- 同步策略更适合在应用层控制
-- 保持底层组件简单，避免过度设计
-- 当前 `sync_on_write` 模式已满足大部分场景
-
-**状态**: 已实现但不集成 ✅
+**教学价值**:
+- 展示策略模式在实际组件中的集成
+- 演示如何在保持 API 兼容的同时升级功能
+- 提供同步性能与数据安全的权衡实践
 
 ---
 
 ### 3. 测试覆盖不足
 
-**现有测试**: Storage trait、FileStorage 并发、SegmentManager 轮转、LogWriter 写入、MemoryStorage
+**现有测试**: Storage trait、FileStorage 并发、SegmentManager 轮转、LogWriter 写入、MemoryStorage、SyncStrategy 单元测试
 
 **缺少的高级测试**:
 - WalManager 完整生命周期测试（创建→写入→崩溃→恢复）
@@ -48,6 +49,7 @@
 - 协调器协作测试
 - 检查点创建/加载/删除流程测试
 - 段轮转期间并发读写测试
+- **新增**: 不同 SyncMode 的性能对比测试
 
 ---
 
@@ -56,7 +58,7 @@
 | 优先级 | 问题 | 修复复杂度 |
 |--------|------|------------|
 | P1 | 性能基准测试 | 中 |
-| P2 | 测试覆盖不足 | 中 |
+| P2 | 测试覆盖不足（含 SyncMode 性能测试） | 中 |
 
 ---
 

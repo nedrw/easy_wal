@@ -10,6 +10,7 @@
   - WalManager 完整生命周期测试
   - RecoveryManager 场景测试
   - 协调器协作测试
+  - 不同 SyncMode 的性能对比测试
 
 ## 已完成
 
@@ -27,8 +28,9 @@
   - verify_record 验证 Magic + Length + CRC32
   - find_next_magic 用于损坏时快速跳到下一条记录
   - LogWriter/LogReader/RecoveryManager 全部对齐新格式
-- [x] SyncStrategy 架构决策
-  - 决策：保持分离，`LogWriter` 保持简单，策略在 API 层管理
-  - `SyncStrategy` 已完整实现（None/FsyncOnWrite/Periodic/Batch）
-  - 当前 `LogWriter` 使用 `sync_on_write: bool` 已满足需求
-  - 复杂策略保留给上层应用自行使用
+- [x] SyncStrategy 集成到 LogWriter
+  - `LogWriterConfig` 使用 `sync_mode: SyncMode` 替代 `sync_on_write: bool`
+  - 支持四种同步模式：None、FsyncOnWrite、Periodic(interval_ms)、Batch(batch_size)
+  - `WalConfig` 和 `WalBuilder` 新增 `with_sync_mode()` API
+  - 保持向后兼容：`with_sync_on_write(true/false)` 自动映射
+  - `LogWriter` 新增 `sync_stats()` 和 `sync_mode()` 方法

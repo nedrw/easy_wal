@@ -4,9 +4,11 @@
 //! - 学习组件协作设计
 //! - 学习状态管理
 //! - 学习资源池化
+//! - 学习同步策略集成
 
 use super::{FileStorage, SegmentConfig, SegmentManager, Storage, crc32, format};
 use crate::prelude::*;
+use crate::wal::SyncMode;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -16,8 +18,8 @@ use tokio::sync::RwLock;
 pub struct LogWriterConfig {
     /// 段配置
     pub segment_config: SegmentConfig,
-    /// 写入后是否同步
-    pub sync_on_write: bool,
+    /// 同步模式
+    pub sync_mode: SyncMode,
     /// 缓冲区大小
     pub buffer_size: usize,
 }
@@ -26,7 +28,7 @@ impl Default for LogWriterConfig {
     fn default() -> Self {
         Self {
             segment_config: SegmentConfig::default(),
-            sync_on_write: false,
+            sync_mode: SyncMode::None,
             buffer_size: 64 * 1024, // 64KB
         }
     }
@@ -43,8 +45,19 @@ impl LogWriterConfig {
         self
     }
 
+    /// 设置同步模式
+    pub fn with_sync_mode(mut self, mode: SyncMode) -> Self {
+        self.sync_mode = mode;
+        self
+    }
+
+    /// 兼容旧 API：设置是否每次写入后同步
     pub fn with_sync_on_write(mut self, sync: bool) -> Self {
-        self.sync_on_write = sync;
+        self.sync_mode = if sync {
+            SyncMode::FsyncOnWrite
+        } else {
+            SyncMode::None
+        };
         self
     }
 }
@@ -63,10 +76,13 @@ pub struct WritePosition {
 /// 日志写入器
 ///
 /// 封装段管理和存储操作，提供统一的写入接口。
+/// 支持多种同步策略，在性能和数据安全性之间取得平衡。
 pub struct LogWriter {
     config: LogWriterConfig,
     segment_manager: RwLock<SegmentManager>,
     active_storage: RwLock<Option<Arc<FileStorage>>>,
+    /// 同步策略
+    sync_strategy: RwLock<crate::wal::SyncStrategy>,
 }
 
 impl LogWriter {
@@ -75,10 +91,13 @@ impl LogWriter {
         let segment_manager = SegmentManager::new(config.segment_config.clone())
             .map_err(|e| Error::Generic(format!("Failed to create segment manager: {}", e)))?;
 
+        let sync_strategy = crate::wal::SyncStrategy::new(config.sync_mode);
+
         Ok(Self {
             config,
             segment_manager: RwLock::new(segment_manager),
             active_storage: RwLock::new(None),
+            sync_strategy: RwLock::new(sync_strategy),
         })
     }
 
@@ -123,6 +142,12 @@ impl LogWriter {
     ///
     /// 格式：[8字节长度][4字节CRC32][数据...]
     ///
+    /// 根据配置的同步策略决定何时执行 fsync：
+    /// - None: 不主动同步，依赖操作系统
+    /// - FsyncOnWrite: 每次写入后同步
+    /// - Batch: 每 N 次写入后同步
+    /// - Periodic: 按时间间隔同步
+    ///
     /// # 返回
     /// 返回写入位置信息（offset 为数据开始位置，不含记录头）
     pub async fn write(&self, data: &[u8]) -> Result<WritePosition> {
@@ -165,9 +190,20 @@ impl LogWriter {
             *active = None;
         }
 
-        // 如果配置了 sync_on_write，同步数据
-        if self.config.sync_on_write {
+        // 使用 SyncStrategy 决定是否同步
+        let should_sync = {
+            let mut strategy = self.sync_strategy.write().await;
+            strategy.on_write(total_len).await
+        };
+
+        if should_sync.is_some() {
+            let start = std::time::Instant::now();
             storage.sync().await?;
+            let duration_ms = start.elapsed().as_millis() as u64;
+
+            // 记录同步统计
+            let mut strategy = self.sync_strategy.write().await;
+            strategy.on_synced(total_len, duration_ms).await;
         }
 
         Ok(WritePosition {
@@ -178,6 +214,9 @@ impl LogWriter {
     }
 
     /// 批量写入
+    ///
+    /// 所有数据写入后，根据同步策略决定是否执行一次同步。
+    /// 对于 Batch 模式，这表示一批写入，只会计数一次。
     pub async fn write_batch(&self, data_list: &[&[u8]]) -> Result<Vec<WritePosition>> {
         let mut positions = Vec::with_capacity(data_list.len());
 
@@ -216,12 +255,36 @@ impl LogWriter {
     }
 
     /// 同步所有未持久化的数据
+    ///
+    /// 强制立即执行 fsync，并更新同步策略状态。
     pub async fn sync(&self) -> Result<()> {
         let storage = self.active_storage.read().await;
         if let Some(ref s) = *storage {
+            let start = std::time::Instant::now();
             s.sync().await?;
+            let duration_ms = start.elapsed().as_millis() as u64;
+
+            // 获取待同步字节数并更新策略状态
+            let pending_bytes = {
+                let strategy = self.sync_strategy.read().await;
+                strategy.pending_bytes()
+            };
+
+            let mut strategy = self.sync_strategy.write().await;
+            strategy.on_synced(pending_bytes, duration_ms).await;
         }
         Ok(())
+    }
+
+    /// 获取同步统计信息
+    pub async fn sync_stats(&self) -> crate::wal::SyncStats {
+        let strategy = self.sync_strategy.read().await;
+        strategy.stats().await
+    }
+
+    /// 获取当前同步模式
+    pub fn sync_mode(&self) -> SyncMode {
+        self.config.sync_mode
     }
 
     /// 关闭写入器

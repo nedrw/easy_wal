@@ -7,7 +7,7 @@
 
 use super::{
     Checkpoint, CheckpointPosition, ReadCoordinator, RecoveryManager, RecoveryMode, RecoveryResult,
-    WriteCoordinator,
+    SyncMode, WriteCoordinator,
 };
 use crate::prelude::*;
 use crate::storage::{LogReader, LogReaderConfig, LogWriter, LogWriterConfig, WritePosition};
@@ -21,8 +21,8 @@ pub struct WalConfig {
     pub dir: std::path::PathBuf,
     /// 最大段大小
     pub max_segment_size: u64,
-    /// 写入后同步
-    pub sync_on_write: bool,
+    /// 同步模式
+    pub sync_mode: SyncMode,
     /// 批量大小
     pub batch_size: usize,
     /// 预读缓冲区大小
@@ -34,7 +34,7 @@ impl Default for WalConfig {
         Self {
             dir: std::path::PathBuf::from("wal_data"),
             max_segment_size: 64 * 1024 * 1024, // 64MB
-            sync_on_write: false,
+            sync_mode: SyncMode::None,
             batch_size: 100,
             read_ahead_size: 64 * 1024, // 64KB
         }
@@ -52,8 +52,19 @@ impl WalConfig {
         self
     }
 
+    /// 设置同步模式
+    pub fn with_sync_mode(mut self, mode: SyncMode) -> Self {
+        self.sync_mode = mode;
+        self
+    }
+
+    /// 兼容旧 API：设置是否每次写入后同步
     pub fn with_sync_on_write(mut self, sync: bool) -> Self {
-        self.sync_on_write = sync;
+        self.sync_mode = if sync {
+            SyncMode::FsyncOnWrite
+        } else {
+            SyncMode::None
+        };
         self
     }
 
@@ -97,7 +108,7 @@ impl WalManager {
         let writer_config = LogWriterConfig::default()
             .with_dir(&config.dir)
             .with_max_segment_size(config.max_segment_size)
-            .with_sync_on_write(config.sync_on_write);
+            .with_sync_mode(config.sync_mode);
         let writer = Arc::new(LogWriter::new(writer_config).await?);
 
         // 创建读取器
@@ -256,7 +267,12 @@ impl WalBuilder {
     }
 
     pub fn with_sync_on_write(mut self, sync: bool) -> Self {
-        self.config.sync_on_write = sync;
+        self.config = self.config.with_sync_on_write(sync);
+        self
+    }
+
+    pub fn with_sync_mode(mut self, mode: SyncMode) -> Self {
+        self.config = self.config.with_sync_mode(mode);
         self
     }
 
