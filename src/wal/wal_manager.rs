@@ -25,6 +25,8 @@ pub struct WalConfig {
     pub sync_on_write: bool,
     /// 批量大小
     pub batch_size: usize,
+    /// 预读缓冲区大小
+    pub read_ahead_size: usize,
 }
 
 impl Default for WalConfig {
@@ -34,6 +36,7 @@ impl Default for WalConfig {
             max_segment_size: 64 * 1024 * 1024, // 64MB
             sync_on_write: false,
             batch_size: 100,
+            read_ahead_size: 64 * 1024, // 64KB
         }
     }
 }
@@ -56,6 +59,11 @@ impl WalConfig {
 
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.batch_size = size;
+        self
+    }
+
+    pub fn with_read_ahead_size(mut self, size: usize) -> Self {
+        self.read_ahead_size = size;
         self
     }
 }
@@ -102,7 +110,8 @@ impl WalManager {
 
         // 创建协调器
         let write_coordinator = Arc::new(WriteCoordinator::new(writer));
-        let read_coordinator = Arc::new(ReadCoordinator::new(reader));
+        let read_coordinator =
+            Arc::new(ReadCoordinator::new(reader).with_read_ahead(config.read_ahead_size));
 
         // 创建恢复管理器
         let recovery_manager = RecoveryManager::new(&config.dir);
@@ -256,6 +265,11 @@ impl WalBuilder {
         self
     }
 
+    pub fn with_read_ahead_size(mut self, size: usize) -> Self {
+        self.config.read_ahead_size = size;
+        self
+    }
+
     pub async fn build(&self) -> Result<WalManager> {
         WalManager::new(self.config.clone()).await
     }
@@ -338,8 +352,9 @@ mod tests {
         wal.write(b"first").await.unwrap();
         wal.write(b"second").await.unwrap();
 
-        // 跳到位置 0 读取第一条
-        wal.seek(1, 0).await;
+        // 跳到位置 0 读取第一条 (实际上应该跳过 16 字节段头)
+        // 新格式: [16字节段头][记录1][记录2]...
+        wal.seek(1, 16).await;
         let record = wal.read().await.unwrap();
         assert_eq!(record.data, b"first");
 

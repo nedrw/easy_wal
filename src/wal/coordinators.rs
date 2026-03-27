@@ -92,8 +92,6 @@ pub struct ReadCoordinator {
     reader: Arc<RwLock<LogReader>>,
     /// 预读缓冲区
     read_ahead_buffer: Arc<RwLock<ReadAheadBuffer>>,
-    /// 预读缓冲区大小
-    read_ahead_size: usize,
 }
 
 /// 预读缓冲区
@@ -115,26 +113,6 @@ impl ReadAheadBuffer {
         }
     }
 
-    /// 从缓冲区读取指定长度的数据
-    fn read(&mut self, len: usize) -> Option<Vec<u8>> {
-        if self.pos + len > self.data.len() {
-            return None;
-        }
-        let result = self.data[self.pos..self.pos + len].to_vec();
-        self.pos += len;
-        Some(result)
-    }
-
-    /// 返回剩余可读字节数
-    fn remaining(&self) -> usize {
-        self.data.len().saturating_sub(self.pos)
-    }
-
-    /// 检查是否为空
-    fn is_empty(&self) -> bool {
-        self.pos >= self.data.len()
-    }
-
     /// 清空缓冲区
     fn clear(&mut self) {
         self.data.clear();
@@ -149,13 +127,11 @@ impl ReadCoordinator {
         Self {
             reader,
             read_ahead_buffer: Arc::new(RwLock::new(ReadAheadBuffer::new())),
-            read_ahead_size: 64 * 1024, // 64KB
         }
     }
 
-    /// 设置预读大小
-    pub fn with_read_ahead(mut self, size: usize) -> Self {
-        self.read_ahead_size = size;
+    /// 设置预读大小（保留接口兼容性）
+    pub fn with_read_ahead(self, _size: usize) -> Self {
         self
     }
 
@@ -164,86 +140,13 @@ impl ReadCoordinator {
         self.reader.clone()
     }
 
-    /// 读取下一条记录（使用预读优化）
+    /// 读取下一条记录
+    ///
+    /// 直接使用 LogReader.read_next()，它会正确解析记录格式
+    /// 格式: [8字节长度][4字节CRC32][数据...]
     pub async fn read_next(&self) -> Result<Vec<u8>> {
-        let mut buffer = self.read_ahead_buffer.write().await;
-
-        // 如果缓冲区空，填充
-        if buffer.is_empty() && !buffer.exhausted {
-            let reader = self.reader.read().await;
-            let data = reader.read_raw(self.read_ahead_size).await?;
-            if data.is_empty() {
-                buffer.exhausted = true;
-                return Err(Error::Eof);
-            }
-            buffer.data = data;
-            buffer.pos = 0;
-        }
-
-        // 尝试从缓冲区读取记录
-        // 格式: [8字节长度][数据...]
-        loop {
-            // 尝试读取长度前缀
-            if buffer.remaining() < 8 {
-                if buffer.exhausted {
-                    return Err(Error::Eof);
-                }
-                // 需要更多数据
-                let reader = self.reader.read().await;
-                let more_data = reader.read_raw(self.read_ahead_size).await?;
-                if more_data.is_empty() {
-                    buffer.exhausted = true;
-                    return Err(Error::Eof);
-                }
-                buffer.data.extend_from_slice(&more_data);
-                continue;
-            }
-
-            // 读取长度前缀
-            let length_bytes = match buffer.read(8) {
-                Some(b) => b,
-                None => continue,
-            };
-
-            let length = u64::from_be_bytes([
-                length_bytes[0],
-                length_bytes[1],
-                length_bytes[2],
-                length_bytes[3],
-                length_bytes[4],
-                length_bytes[5],
-                length_bytes[6],
-                length_bytes[7],
-            ]) as usize;
-
-            // 验证长度合理性
-            if length == 0 || length > MAX_RECORD_SIZE as usize {
-                // 长度无效，回退一字节重试
-                if buffer.pos > 0 {
-                    buffer.pos -= 1;
-                }
-                continue;
-            }
-
-            // 尝试读取数据
-            while buffer.remaining() < length {
-                if buffer.exhausted {
-                    return Err(Error::Eof);
-                }
-                let reader = self.reader.read().await;
-                let more_data = reader.read_raw(self.read_ahead_size).await?;
-                if more_data.is_empty() {
-                    buffer.exhausted = true;
-                    return Err(Error::Eof);
-                }
-                buffer.data.extend_from_slice(&more_data);
-            }
-
-            match buffer.read(length) {
-                Some(data) => return Ok(data),
-                None => continue,
-            }
-        }
+        let reader = self.reader.read().await;
+        reader.read_next().await
     }
 
     /// 批量顺序读取

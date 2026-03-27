@@ -7,7 +7,7 @@
 
 use crate::error::Error;
 use crate::prelude::*;
-use crate::storage::{FileStorage, Storage};
+use crate::storage::{FileStorage, Storage, crc32, format};
 use std::path::{Path, PathBuf};
 
 /// Checkpoint 数据结构
@@ -317,9 +317,11 @@ impl RecoveryManager {
 
     /// 验证记录的完整性
     ///
-    /// 检查长度前缀是否有效。
+    /// 检查长度前缀和CRC32是否有效。
+    /// 格式：[8字节长度][4字节CRC32][数据...]
+    ///
     /// 返回值：
-    /// - Ok(true): 记录完整
+    /// - Ok(true): 记录完整且CRC验证通过
     /// - Ok(false): 记录损坏或部分写入
     /// - Err: 读取错误
     pub async fn verify_record(&self, storage: &FileStorage, offset: u64) -> Result<bool> {
@@ -342,16 +344,37 @@ impl RecoveryManager {
         ]);
 
         // 验证长度合理性（最大 64MB）
-        if length == 0 || length > 64 * 1024 * 1024 {
+        if length == 0 || length > format::MAX_RECORD_SIZE {
             return Ok(false);
         }
 
+        // 读取 CRC32 (4 bytes)
+        let crc_offset = offset + 8;
+        let crc_bytes = match storage.read(crc_offset, 4).await {
+            Ok(bytes) if bytes.len() == 4 => bytes,
+            Ok(_) => return Ok(false), // 不够 4 字节
+            Err(e) => return Err(e),
+        };
+        let expected_crc =
+            u32::from_be_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+
         // 验证数据是否可读
-        let data_offset = offset + 8;
+        let data_offset = offset + format::RECORD_HEADER_SIZE;
         let file_size = storage.size().await?;
 
         if data_offset + length > file_size {
             return Ok(false); // 数据不完整
+        }
+
+        // 读取数据并验证 CRC32
+        let data = match storage.read(data_offset, length).await {
+            Ok(d) => d,
+            Err(e) => return Err(e),
+        };
+
+        let actual_crc = crc32(&data);
+        if actual_crc != expected_crc {
+            return Ok(false); // CRC 校验失败
         }
 
         Ok(true)
@@ -454,10 +477,10 @@ impl RecoveryManager {
             };
 
             let file_size = storage.size().await?;
-            let mut offset = 0u64;
+            let mut offset = format::SEGMENT_HEADER_SIZE; // 跳过段文件头
 
             // 扫描段文件中的每条记录
-            while offset + 8 <= file_size {
+            while offset + format::RECORD_HEADER_SIZE <= file_size {
                 match self.verify_record(&storage, offset).await {
                     Ok(true) => {
                         // 读取长度获取下一条记录位置
@@ -480,18 +503,18 @@ impl RecoveryManager {
 
                         last_valid_position = CheckpointPosition {
                             segment_id,
-                            offset: offset + 8 + length, // 下一条记录起始位置
+                            offset: offset + format::RECORD_HEADER_SIZE + length, // 下一条记录起始位置
                             last_record_start: offset,
                         };
 
-                        offset += 8 + length;
+                        offset += format::RECORD_HEADER_SIZE + length;
                     }
                     Ok(false) => {
                         // 记录损坏，跳过到下一个可能的记录位置
-                        // 注意：逐字节前进是 O(n²) 的，但在实际场景中损坏通常是局部的
-                        // 如果需要更高性能，可以考虑添加 magic number 标记记录边界
+                        // 使用 8 字节对齐前进（记录长度前缀是 8 字节对齐）
+                        // 这将最坏情况复杂度从 O(n²) 降低到 O(n)
                         corrupted_skipped += 1;
-                        offset += 1; // 逐字节前进寻找下一个可能的长度前缀
+                        offset += 8;
                     }
                     Err(_) => {
                         // 读取错误，停止扫描
@@ -621,6 +644,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_record() {
+        use crate::storage::crc32;
+
         let temp_dir = tempdir().unwrap();
         let manager = RecoveryManager::new(temp_dir.path());
 
@@ -629,17 +654,20 @@ mod tests {
             .await
             .unwrap();
 
-        // 写入有效记录: [8字节长度][数据]
+        // 写入有效记录: [8字节长度][4字节CRC32][数据]
         let data = b"hello world";
+        let data_crc = crc32(data);
         let length_bytes = (data.len() as u64).to_be_bytes();
+        let crc_bytes = data_crc.to_be_bytes();
         storage.append(&length_bytes).await.unwrap();
+        storage.append(&crc_bytes).await.unwrap();
         storage.append(data).await.unwrap();
 
-        // 验证记录
+        // 验证记录 (从偏移量0开始，即记录开始位置)
         let valid = manager.verify_record(&storage, 0).await.unwrap();
         assert!(valid);
 
-        // 验证损坏记录
+        // 验证损坏记录 (偏移量8处不是有效的记录头)
         let valid = manager.verify_record(&storage, 8).await.unwrap();
         assert!(!valid);
     }

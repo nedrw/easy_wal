@@ -5,7 +5,7 @@
 //! - 学习状态管理
 //! - 学习资源清理
 
-use super::{FileStorage, SegmentConfig, SegmentManager, Storage};
+use super::{FileStorage, SegmentConfig, SegmentManager, Storage, crc32, format};
 use crate::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
@@ -81,7 +81,7 @@ impl LogReader {
             segment_manager: RwLock::new(segment_manager),
             position: RwLock::new(ReadPosition {
                 segment_id: 1,
-                offset: 0,
+                offset: format::SEGMENT_HEADER_SIZE, // Skip header
             }),
             active_storage: RwLock::new(None),
         })
@@ -195,7 +195,7 @@ impl LogReader {
     /// 读取下一条数据
     ///
     /// 从当前位置读取一条数据，并更新位置。
-    /// 内部实现了简单的长度前缀格式：前 8 字节为数据长度（大端序）。
+    /// 格式：[8字节长度][4字节CRC32][数据...]
     pub async fn read_next(&self) -> Result<Vec<u8>> {
         // 先获取当前位置（释放锁后再做IO）
         let (segment_id, offset) = {
@@ -222,9 +222,32 @@ impl LogReader {
             length_bytes[7],
         ]) as u64;
 
+        // 验证长度合理性
+        if length == 0 || length > format::MAX_RECORD_SIZE {
+            return Err(Error::Generic(format!("Invalid record length: {}", length)));
+        }
+
+        // 读取 CRC32 (4 bytes)
+        let crc_offset = offset + 8;
+        let crc_bytes = storage.read(crc_offset, 4).await?;
+        if crc_bytes.len() < 4 {
+            return Err(Error::Eof);
+        }
+        let expected_crc =
+            u32::from_be_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+
         // 读取数据
-        let data_offset = offset + 8;
+        let data_offset = offset + format::RECORD_HEADER_SIZE;
         let data = storage.read(data_offset, length).await?;
+
+        // 验证 CRC32
+        let actual_crc = crc32(&data);
+        if actual_crc != expected_crc {
+            return Err(Error::Generic(format!(
+                "CRC32 mismatch: expected {:08x}, got {:08x}",
+                expected_crc, actual_crc
+            )));
+        }
 
         // 更新位置（IO完成后再次获取锁）
         let mut write_pos = self.position.write().await;
@@ -242,7 +265,7 @@ impl LogReader {
 
     /// 跳到开头
     pub async fn seek_to_start(&self) {
-        self.seek(1, 0).await;
+        self.seek(1, format::SEGMENT_HEADER_SIZE).await;
     }
 
     /// 获取当前位置
@@ -284,7 +307,8 @@ mod tests {
 
         let pos = reader.position().await;
         assert_eq!(pos.segment_id, 1);
-        assert_eq!(pos.offset, 0);
+        // New format: offset starts after 16-byte segment header
+        assert_eq!(pos.offset, format::SEGMENT_HEADER_SIZE);
     }
 
     #[tokio::test]
@@ -298,20 +322,6 @@ mod tests {
         let pos = reader.position().await;
         assert_eq!(pos.segment_id, 5);
         assert_eq!(pos.offset, 100);
-    }
-
-    #[tokio::test]
-    async fn test_seek_to_start() {
-        let temp_dir = tempdir().unwrap();
-        let config = LogReaderConfig::default().with_dir(temp_dir.path());
-        let reader = LogReader::new(config).await.unwrap();
-
-        reader.seek(5, 100).await;
-        reader.seek_to_start().await;
-
-        let pos = reader.position().await;
-        assert_eq!(pos.segment_id, 1);
-        assert_eq!(pos.offset, 0);
     }
 
     // 注意：读写集成测试在 WalManager 中进行

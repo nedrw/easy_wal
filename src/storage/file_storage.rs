@@ -8,7 +8,7 @@
 //! - 学习错误处理和资源管理
 //! - 学习线程安全的文件访问
 
-use super::{Location, Storage, StorageStats};
+use super::{Location, Storage, StorageStats, format};
 use crate::prelude::*;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -55,10 +55,11 @@ impl FileStorage {
 
         // 确保父目录存在
         if let Some(parent) = path.parent()
-            && !parent.exists() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| Error::Generic(format!("Failed to create directory: {}", e)))?;
-            }
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Generic(format!("Failed to create directory: {}", e)))?;
+        }
 
         // 打开或创建文件
         let file = OpenOptions::new()
@@ -89,6 +90,88 @@ impl FileStorage {
     /// 获取文件路径
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 写入段文件头
+    ///
+    /// 如果文件为空，写入 16 字节的段文件头。
+    /// 如果文件已有内容，不重复写入。
+    pub async fn write_header_if_empty(&self) -> Result<()> {
+        let mut file = self.file.write().await;
+
+        // 获取当前文件大小
+        let current_size = file
+            .metadata()
+            .await
+            .map_err(|e| Error::Generic(format!("Failed to get metadata: {}", e)))?
+            .len();
+
+        // 如果文件非空，跳过
+        if current_size > 0 {
+            return Ok(());
+        }
+
+        // 写入段文件头
+        let header = format::SegmentHeader::default();
+        let header_bytes = header.to_bytes();
+
+        file.seek(std::io::SeekFrom::Start(0))
+            .await
+            .map_err(|e| Error::Generic(format!("Seek failed: {}", e)))?;
+
+        file.write_all(&header_bytes)
+            .await
+            .map_err(|e| Error::Generic(format!("Write header failed: {}", e)))?;
+
+        // 更新统计信息
+        drop(file);
+        {
+            let mut stats = self.stats.write().await;
+            stats.size = format::SEGMENT_HEADER_SIZE;
+        }
+
+        Ok(())
+    }
+
+    /// 读取并验证段文件头
+    ///
+    /// # 返回
+    /// - Ok(Some(header)) - 头有效
+    /// - Ok(None) - 文件为空或太小
+    /// - Err - 头无效或版本不匹配
+    pub async fn read_header(&self) -> Result<Option<format::SegmentHeader>> {
+        let mut file = self.file.write().await;
+
+        let size = file
+            .metadata()
+            .await
+            .map_err(|e| Error::Generic(format!("Failed to get metadata: {}", e)))?
+            .len();
+
+        if size < format::SEGMENT_HEADER_SIZE {
+            return Ok(None);
+        }
+
+        let mut header_bytes = [0u8; 16];
+        file.seek(std::io::SeekFrom::Start(0))
+            .await
+            .map_err(|e| Error::Generic(format!("Seek failed: {}", e)))?;
+
+        file.read_exact(&mut header_bytes)
+            .await
+            .map_err(|e| Error::Generic(format!("Read header failed: {}", e)))?;
+
+        drop(file);
+
+        match format::SegmentHeader::from_bytes(&header_bytes) {
+            Ok(header) => Ok(Some(header)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 检查文件是否有有效的段文件头
+    pub async fn has_valid_header(&self) -> bool {
+        self.read_header().await.is_ok()
     }
 
     /// 内部读取方法，不更新统计信息

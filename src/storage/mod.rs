@@ -8,6 +8,138 @@
 //! - 学习错误处理最佳实践
 //! - 学习文件 I/O 操作
 
+/// WAL 段文件格式常量
+pub mod format {
+    /// 段文件魔数 "WAL\0"
+    pub const SEGMENT_MAGIC: u32 = 0x57414C00;
+    /// 检查点魔数 "CKPT"
+    pub const CHECKPOINT_MAGIC: u32 = 0x434B5054;
+    /// 当前格式版本
+    pub const FORMAT_VERSION: u32 = 1;
+    /// 段文件头大小 (4 + 4 + 8 = 16 bytes)
+    pub const SEGMENT_HEADER_SIZE: u64 = 16;
+    /// 检查点最小大小 (4 + 4 + 4 = 12 bytes, 不含payload)
+    pub const CHECKPOINT_HEADER_SIZE: u64 = 12;
+    /// 单条记录头大小 (8 length + 4 crc = 12 bytes)
+    pub const RECORD_HEADER_SIZE: u64 = 12;
+    /// 最大记录大小 (64MB)
+    pub const MAX_RECORD_SIZE: u64 = 64 * 1024 * 1024;
+
+    use crate::prelude::*;
+
+    /// 段文件头
+    ///
+    /// 每个段文件开头都有一个固定头，用于标识文件类型和格式版本。
+    #[derive(Debug, Clone, Copy)]
+    pub struct SegmentHeader {
+        /// 魔数 (0x57414C00)
+        pub magic: u32,
+        /// 格式版本
+        pub version: u32,
+        /// 创建时间戳 (Unix timestamp)
+        pub created: u64,
+    }
+
+    impl SegmentHeader {
+        /// 从字节流读取并验证
+        pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+            if bytes.len() < 16 {
+                return Err(Error::Generic("Segment header too short".into()));
+            }
+
+            let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            if magic != SEGMENT_MAGIC {
+                return Err(Error::Generic(format!(
+                    "Invalid segment magic: expected {:08x}, got {:08x}",
+                    SEGMENT_MAGIC, magic
+                )));
+            }
+
+            let version = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            if version != FORMAT_VERSION {
+                return Err(Error::Generic(format!(
+                    "Unsupported segment version: {}",
+                    version
+                )));
+            }
+
+            let created = u64::from_be_bytes([
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
+            ]);
+
+            Ok(Self {
+                magic,
+                version,
+                created,
+            })
+        }
+
+        /// 序列化为字节流
+        pub fn to_bytes(&self) -> [u8; 16] {
+            let mut bytes = [0u8; 16];
+            bytes[0..4].copy_from_slice(&self.magic.to_be_bytes());
+            bytes[4..8].copy_from_slice(&self.version.to_be_bytes());
+            bytes[8..16].copy_from_slice(&self.created.to_be_bytes());
+            bytes
+        }
+    }
+
+    impl Default for SegmentHeader {
+        fn default() -> Self {
+            Self {
+                magic: SEGMENT_MAGIC,
+                version: FORMAT_VERSION,
+                created: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            }
+        }
+    }
+
+    /// 检查点头
+    #[derive(Debug, Clone, Copy)]
+    pub struct CheckpointHeader {
+        /// 魔数 (0x434B5054)
+        pub magic: u32,
+        /// 格式版本
+        pub version: u32,
+        /// 头部 CRC32 校验和 (对 payload 进行校验)
+        pub header_crc: u32,
+    }
+
+    impl CheckpointHeader {
+        pub const SIZE: usize = 12;
+
+        /// 从字节流读取
+        pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+            if bytes.len() < Self::SIZE {
+                return Err(Error::Generic("Checkpoint header too short".into()));
+            }
+
+            let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let version = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            let header_crc = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+
+            Ok(Self {
+                magic,
+                version,
+                header_crc,
+            })
+        }
+
+        /// 序列化
+        pub fn to_bytes(&self) -> [u8; 12] {
+            let mut bytes = [0u8; 12];
+            bytes[0..4].copy_from_slice(&self.magic.to_be_bytes());
+            bytes[4..8].copy_from_slice(&self.version.to_be_bytes());
+            bytes[8..12].copy_from_slice(&self.header_crc.to_be_bytes());
+            bytes
+        }
+    }
+}
+
 pub mod checksum;
 pub mod file_storage;
 pub mod log_reader;

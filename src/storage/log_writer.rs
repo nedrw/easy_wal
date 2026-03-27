@@ -5,7 +5,7 @@
 //! - 学习状态管理
 //! - 学习资源池化
 
-use super::{FileStorage, SegmentConfig, SegmentManager, Storage};
+use super::{FileStorage, SegmentConfig, SegmentManager, Storage, crc32, format};
 use crate::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
@@ -109,6 +109,9 @@ impl LogWriter {
                 .map_err(|e| Error::Generic(format!("Failed to create storage: {}", e)))?,
         );
 
+        // 写入段文件头
+        storage.write_header_if_empty().await?;
+
         // 保存到活跃存储
         let mut active = self.active_storage.write().await;
         *active = Some(storage.clone());
@@ -116,13 +119,12 @@ impl LogWriter {
         Ok(storage)
     }
 
-    /// 写入数据（带长度前缀）
+    /// 写入数据（带长度前缀和CRC32）
     ///
-    /// 自动在数据前添加 8 字节长度前缀（大端序）。
-    /// 格式：[8字节长度][数据...]
+    /// 格式：[8字节长度][4字节CRC32][数据...]
     ///
     /// # 返回
-    /// 返回写入位置信息（offset 为数据开始位置，不含长度前缀）
+    /// 返回写入位置信息（offset 为数据开始位置，不含记录头）
     pub async fn write(&self, data: &[u8]) -> Result<WritePosition> {
         // 获取活跃存储
         let storage = self.get_active_storage().await?;
@@ -133,15 +135,22 @@ impl LogWriter {
             manager.active_id()
         };
 
-        // 写入长度前缀
+        // 计算数据CRC32
+        let data_crc = crc32(data);
+
+        // 写入长度前缀 (8 bytes)
         let length_bytes = (data.len() as u64).to_be_bytes();
         let _offset = storage.append(&length_bytes).await?;
+
+        // 写入CRC32 (4 bytes)
+        let crc_bytes = data_crc.to_be_bytes();
+        storage.append(&crc_bytes).await?;
 
         // 写入数据
         let data_offset = storage.append(data).await?;
 
-        // 计算总长度（含前缀）
-        let total_len = 8 + data.len() as u64;
+        // 计算总长度（含记录头）
+        let total_len = format::RECORD_HEADER_SIZE + data.len() as u64;
 
         // 更新段大小，检查是否需要轮转
         let should_rotate = {
@@ -238,7 +247,8 @@ mod tests {
         let pos = writer.write(b"hello world").await.unwrap();
 
         assert_eq!(pos.segment_id, 1);
-        assert_eq!(pos.offset, 8); // data starts after 8-byte length prefix
+        // offset = 16 (segment header) + 12 (record header: 8 length + 4 crc)
+        assert_eq!(pos.offset, 28);
         assert_eq!(pos.length, 11);
     }
 
