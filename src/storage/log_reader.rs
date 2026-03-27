@@ -248,18 +248,6 @@ mod tests {
     use crate::storage::{LogWriter, LogWriterConfig};
     use tempfile::tempdir;
 
-    fn create_test_writer(dir: &Path) -> LogWriter {
-        let config = LogWriterConfig::default()
-            .with_dir(dir)
-            .with_max_segment_size(1000);
-        // 注意：这里需要 sync_on_write 为 true 以确保数据持久化
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(LogWriter::new(config))
-            .unwrap()
-    }
-
     #[tokio::test]
     async fn test_read_empty_segment() {
         let temp_dir = tempdir().unwrap();

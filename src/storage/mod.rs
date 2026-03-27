@@ -8,19 +8,17 @@
 //! - 学习错误处理最佳实践
 //! - 学习文件 I/O 操作
 
-mod file_storage;
-mod log_reader;
-mod log_writer;
-mod memory_storage;
-mod segment_manager;
-mod wal_manager;
+pub mod file_storage;
+pub mod log_reader;
+pub mod log_writer;
+pub mod memory_storage;
+pub mod segment_manager;
 
 pub use file_storage::FileStorage;
 pub use log_reader::{LogReader, LogReaderConfig, ReadPosition};
 pub use log_writer::{LogWriter, LogWriterConfig, WritePosition};
 pub use memory_storage::MemoryStorage;
 pub use segment_manager::{SegmentConfig, SegmentManager, SegmentMeta};
-pub use wal_manager::{Record, WalBuilder, WalConfig, WalManager};
 
 use crate::prelude::*;
 use async_trait::async_trait;

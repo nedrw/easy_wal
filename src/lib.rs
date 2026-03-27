@@ -28,10 +28,19 @@
 mod error;
 mod prelude;
 pub mod storage;
+pub mod wal;
 
 // 重导出常用类型，方便用户使用
 pub use prelude::{Error, Result};
+
+// 存储层导出
 pub use storage::{
     FileStorage, Location, LogWriter, LogWriterConfig, MemoryStorage, SegmentConfig,
     SegmentManager, SegmentMeta, Storage, StorageStats, WritePosition,
+};
+
+// WAL 层导出（协调层 + API 层）
+pub use wal::{
+    Checkpoint, CheckpointPosition, ReadCoordinator, RecoveryManager, RecoveryMode, RecoveryResult,
+    WalBuilder, WalConfig, WalManager, WriteCoordinator,
 };

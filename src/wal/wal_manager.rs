@@ -1,4 +1,4 @@
-//! WAL 管理器 - 统一的读写接口
+//! WAL 管理器 - API 层
 //!
 //! # 教学价值
 //! - 学习 API 设计
@@ -6,13 +6,13 @@
 //! - 学习组件集成
 
 use super::{
-    Checkpoint, CheckpointPosition, LogReader, LogReaderConfig, LogWriter, LogWriterConfig,
-    ReadPosition, RecoveryManager, RecoveryMode, RecoveryResult, WritePosition,
+    Checkpoint, CheckpointPosition, ReadCoordinator, RecoveryManager, RecoveryMode, RecoveryResult,
+    WriteCoordinator,
 };
 use crate::prelude::*;
+use crate::storage::{LogReader, LogReaderConfig, LogWriter, LogWriterConfig, WritePosition};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// WAL 配置
 #[derive(Debug, Clone)]
@@ -71,17 +71,16 @@ pub struct Record {
 
 /// WAL 管理器
 ///
-/// 提供统一的读写接口，内部协调 LogWriter 和 LogReader。
+/// 提供统一的读写接口，内部协调 WriteCoordinator 和 ReadCoordinator。
 pub struct WalManager {
-    writer: Arc<LogWriter>,
-    reader: Arc<RwLock<LogReader>>,
+    write_coordinator: Arc<WriteCoordinator>,
+    read_coordinator: Arc<ReadCoordinator>,
     recovery_manager: RecoveryManager,
-    #[allow(dead_code)]
     config: WalConfig,
 }
 
 impl WalManager {
-    /// 创建 WAL 管理器（同步版本）
+    /// 创建 WAL 管理器
     pub async fn new(config: WalConfig) -> Result<Self> {
         // 创建目录
         tokio::fs::create_dir_all(&config.dir).await?;
@@ -97,12 +96,21 @@ impl WalManager {
         let reader_config = LogReaderConfig::default()
             .with_dir(&config.dir)
             .with_batch_size(config.batch_size);
-        let reader = Arc::new(RwLock::new(LogReader::new(reader_config).await?));
+        let reader = Arc::new(tokio::sync::RwLock::new(
+            LogReader::new(reader_config).await?,
+        ));
+
+        // 创建协调器
+        let write_coordinator = Arc::new(WriteCoordinator::new(writer));
+        let read_coordinator = Arc::new(ReadCoordinator::new(reader));
+
+        // 创建恢复管理器
+        let recovery_manager = RecoveryManager::new(&config.dir);
 
         Ok(Self {
-            writer,
-            reader,
-            recovery_manager: RecoveryManager::new(&config.dir),
+            write_coordinator,
+            read_coordinator,
+            recovery_manager,
             config,
         })
     }
@@ -117,8 +125,7 @@ impl WalManager {
 
         // 将读取器跳转到恢复位置
         if let Some(pos) = recovery_manager.get_recovery_position().await? {
-            let reader = self.reader.write().await;
-            reader.seek(pos.segment_id, pos.offset).await;
+            self.read_coordinator.seek(pos.segment_id, pos.offset).await;
         }
 
         Ok(result)
@@ -126,8 +133,7 @@ impl WalManager {
 
     /// 创建检查点
     pub async fn checkpoint(&self) -> Result<Checkpoint> {
-        let reader = self.reader.read().await;
-        let pos = reader.position().await;
+        let pos = self.read_coordinator.position().await;
 
         let checkpoint = self
             .recovery_manager
@@ -143,34 +149,23 @@ impl WalManager {
     }
 
     /// 写入数据
-    ///
-    /// 使用 LogWriter 内置的长度前缀格式：8 字节长度 + 数据
     pub async fn write(&self, data: &[u8]) -> Result<WritePosition> {
-        self.writer.write(data).await
+        self.write_coordinator.write(data).await
     }
 
     /// 批量写入
     pub async fn write_batch(&self, data_list: &[&[u8]]) -> Result<Vec<WritePosition>> {
-        let mut positions = Vec::with_capacity(data_list.len());
-
-        for data in data_list {
-            let pos = self.write(data).await?;
-            positions.push(pos);
-        }
-
-        Ok(positions)
+        self.write_coordinator.write_batch(data_list).await
     }
 
     /// 读取下一条记录
     pub async fn read(&self) -> Result<Record> {
-        let reader = self.reader.read().await;
-
         // read_next 已经读取了长度前缀，返回的是实际数据
-        let data = reader.read_next().await?;
+        let data = self.read_coordinator.read_next().await?;
         let length = data.len() as u64;
 
         // 获取读取后的位置
-        let pos = reader.position().await;
+        let pos = self.read_coordinator.position().await;
 
         Ok(Record {
             data,
@@ -184,7 +179,6 @@ impl WalManager {
 
     /// 批量读取
     pub async fn read_batch(&self, max_count: usize) -> Result<Vec<Record>> {
-        let _reader = self.reader.read().await;
         let mut records = Vec::with_capacity(max_count);
 
         for _ in 0..max_count {
@@ -200,38 +194,33 @@ impl WalManager {
 
     /// 跳到指定位置
     pub async fn seek(&self, segment_id: u64, offset: u64) {
-        let reader = self.reader.read().await;
-        reader.seek(segment_id, offset).await;
+        self.read_coordinator.seek(segment_id, offset).await;
     }
 
     /// 跳到开头
     pub async fn seek_to_start(&self) {
-        let reader = self.reader.read().await;
-        reader.seek_to_start().await;
+        self.read_coordinator.seek_to_start().await;
     }
 
     /// 获取当前位置
-    pub async fn position(&self) -> ReadPosition {
-        let reader = self.reader.read().await;
-        reader.position().await
+    pub async fn position(&self) -> super::ReadPosition {
+        self.read_coordinator.position().await
     }
 
     /// 获取所有段信息
     pub async fn segments(&self) -> Vec<super::SegmentMeta> {
-        let reader = self.reader.read().await;
-        reader.segments().await
+        self.read_coordinator.segments().await
     }
 
     /// 同步数据
     pub async fn sync(&self) -> Result<()> {
-        self.writer.sync().await
+        self.write_coordinator.sync().await
     }
 
     /// 关闭 WAL
     pub async fn close(&self) -> Result<()> {
-        self.writer.close().await?;
-        let reader = self.reader.read().await;
-        reader.close().await
+        self.write_coordinator.close().await?;
+        self.read_coordinator.close().await
     }
 }
 

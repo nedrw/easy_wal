@@ -5,10 +5,10 @@
 
 ## 架构概览
 ```
-Layer 4: API 层        - WalManager, WalBuilder
-Layer 3: 协调层        - WriteCoordinator, ReadCoordinator, RecoveryManager
-Layer 2: 组件层        - LogWriter, LogReader, SegmentManager
-Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
+Layer 4: API 层        - WalManager, WalBuilder (src/wal/)
+Layer 3: 协调层        - WriteCoordinator, ReadCoordinator, RecoveryManager (src/wal/)
+Layer 2: 组件层        - LogWriter, LogReader, SegmentManager (src/storage/)
+Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage (src/storage/)
 ```
 
 ---
@@ -58,16 +58,16 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
 
 ---
 
-### ⬜ Phase 4: 恢复机制
+### ✅ Phase 4: 恢复机制
 **目标**: 崩溃恢复
 
 **任务**:
-- ⬜ 实现 RecoveryManager
-- ⬜ 实现 Checkpoint 机制
-- ⬜ 处理异常情况
-- ⬜ 添加恢复测试
+- ✅ 实现 RecoveryManager
+- ✅ 实现 Checkpoint 机制
+- ✅ 处理异常情况
+- ✅ 添加恢复测试
 
-**产出**: v0.4.0 - 支持崩溃恢复
+**产出**: v0.4.0 - 支持崩溃恢复 ✅
 
 ---
 
