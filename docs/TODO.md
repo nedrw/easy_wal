@@ -26,6 +26,8 @@
 - [x] 预读缓冲区可配置化
 - [x] CRC32 数据完整性验证
   - 段文件头 (Magic + Version + Created): 16 bytes
-  - 记录格式 [8B长度][4B CRC32][数据...]: 12B + 数据
-  - verify_record 现在验证 CRC32
+  - 记录格式 [4B Magic][4B Length][4B CRC32][Data...]: 12B + 数据
+  - 每条记录带 Magic (0x57414C01)，可快速定位有效记录
+  - verify_record 验证 Magic + Length + CRC32
+  - find_next_magic 用于损坏时快速跳到下一条记录
   - LogWriter/LogReader/RecoveryManager 全部对齐新格式

@@ -138,12 +138,13 @@ impl LogWriter {
         // 计算数据CRC32
         let data_crc = crc32(data);
 
-        // 写入长度前缀 (8 bytes)
-        let length_bytes = (data.len() as u64).to_be_bytes();
-        let _offset = storage.append(&length_bytes).await?;
-
-        // 写入CRC32 (4 bytes)
+        // 写入记录头 (12 bytes): [4B magic][4B length][4B crc]
+        let magic_bytes = format::RECORD_MAGIC.to_be_bytes();
+        let length_bytes = (data.len() as u32).to_be_bytes();
         let crc_bytes = data_crc.to_be_bytes();
+
+        let _offset = storage.append(&magic_bytes).await?;
+        storage.append(&length_bytes).await?;
         storage.append(&crc_bytes).await?;
 
         // 写入数据

@@ -195,7 +195,7 @@ impl LogReader {
     /// 读取下一条数据
     ///
     /// 从当前位置读取一条数据，并更新位置。
-    /// 格式：[8字节长度][4字节CRC32][数据...]
+    /// 格式：[4B Magic][4B Length][4B CRC32][Data...]
     pub async fn read_next(&self) -> Result<Vec<u8>> {
         // 先获取当前位置（释放锁后再做IO）
         let (segment_id, offset) = {
@@ -205,21 +205,34 @@ impl LogReader {
 
         let storage = self.get_storage_for_segment(segment_id).await?;
 
-        // 读取长度前缀 (8 bytes)
-        let length_bytes = storage.read(offset, 8).await?;
-        if length_bytes.is_empty() {
+        // 读取 Magic (4 bytes)
+        let magic_bytes = storage.read(offset, 4).await?;
+        if magic_bytes.len() < 4 {
             return Err(Error::Eof);
         }
+        let magic = u32::from_be_bytes([
+            magic_bytes[0],
+            magic_bytes[1],
+            magic_bytes[2],
+            magic_bytes[3],
+        ]);
+        if magic != format::RECORD_MAGIC {
+            return Err(Error::Generic(format!(
+                "Invalid record magic: {:08x}",
+                magic
+            )));
+        }
 
-        let length = u64::from_be_bytes([
+        // 读取长度 (4 bytes)
+        let length_bytes = storage.read(offset + 4, 4).await?;
+        if length_bytes.len() < 4 {
+            return Err(Error::Eof);
+        }
+        let length = u32::from_be_bytes([
             length_bytes[0],
             length_bytes[1],
             length_bytes[2],
             length_bytes[3],
-            length_bytes[4],
-            length_bytes[5],
-            length_bytes[6],
-            length_bytes[7],
         ]) as u64;
 
         // 验证长度合理性

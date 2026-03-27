@@ -317,31 +317,42 @@ impl RecoveryManager {
 
     /// 验证记录的完整性
     ///
-    /// 检查长度前缀和CRC32是否有效。
-    /// 格式：[8字节长度][4字节CRC32][数据...]
+    /// 检查 Magic、长度和CRC32是否有效。
+    /// 格式：[4B Magic][4B Length][4B CRC32][Data...]
     ///
     /// 返回值：
     /// - Ok(true): 记录完整且CRC验证通过
     /// - Ok(false): 记录损坏或部分写入
     /// - Err: 读取错误
     pub async fn verify_record(&self, storage: &FileStorage, offset: u64) -> Result<bool> {
-        // 读取长度前缀
-        let length_bytes = match storage.read(offset, 8).await {
-            Ok(bytes) if bytes.len() == 8 => bytes,
-            Ok(_) => return Ok(false), // 不够 8 字节
+        // 读取 Magic (4 bytes)
+        let magic_bytes = match storage.read(offset, 4).await {
+            Ok(bytes) if bytes.len() == 4 => bytes,
+            Ok(_) => return Ok(false),
             Err(e) => return Err(e),
         };
+        let magic = u32::from_be_bytes([
+            magic_bytes[0],
+            magic_bytes[1],
+            magic_bytes[2],
+            magic_bytes[3],
+        ]);
+        if magic != format::RECORD_MAGIC {
+            return Ok(false); // Magic 不匹配，不是有效记录
+        }
 
-        let length = u64::from_be_bytes([
+        // 读取长度 (4 bytes)
+        let length_bytes = match storage.read(offset + 4, 4).await {
+            Ok(bytes) if bytes.len() == 4 => bytes,
+            Ok(_) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let length = u32::from_be_bytes([
             length_bytes[0],
             length_bytes[1],
             length_bytes[2],
             length_bytes[3],
-            length_bytes[4],
-            length_bytes[5],
-            length_bytes[6],
-            length_bytes[7],
-        ]);
+        ]) as u64;
 
         // 验证长度合理性（最大 64MB）
         if length == 0 || length > format::MAX_RECORD_SIZE {
@@ -352,7 +363,7 @@ impl RecoveryManager {
         let crc_offset = offset + 8;
         let crc_bytes = match storage.read(crc_offset, 4).await {
             Ok(bytes) if bytes.len() == 4 => bytes,
-            Ok(_) => return Ok(false), // 不够 4 字节
+            Ok(_) => return Ok(false),
             Err(e) => return Err(e),
         };
         let expected_crc =
@@ -383,6 +394,53 @@ impl RecoveryManager {
     /// 获取段文件路径
     fn segment_path(&self, segment_id: u64) -> PathBuf {
         self.dir.join(format!("{:020}.seg", segment_id))
+    }
+
+    /// 在指定位置之后查找下一个记录魔术
+    ///
+    /// 用于损坏恢复时快速定位下一条有效记录。
+    /// 从给定偏移量开始扫描，每次前进固定的步长（4字节）查找魔术。
+    ///
+    /// # 参数
+    /// - storage: 文件存储
+    /// - start: 开始扫描的位置
+    /// - max_scan: 最大扫描字节数（防止无限扫描）
+    ///
+    /// # 返回
+    /// - Ok(Some(offset)): 找到魔术，返回其位置
+    /// - Ok(None): 未找到
+    /// - Err: 读取错误
+    async fn find_next_magic(
+        &self,
+        storage: &FileStorage,
+        start: u64,
+        max_scan: u64,
+    ) -> Result<Option<u64>> {
+        let file_size = storage.size().await?;
+        let mut offset = start;
+        let end = (start + max_scan).min(file_size.saturating_sub(4));
+
+        while offset < end {
+            let magic_bytes = match storage.read(offset, 4).await {
+                Ok(bytes) if bytes.len() == 4 => bytes,
+                _ => break,
+            };
+
+            let magic = u32::from_be_bytes([
+                magic_bytes[0],
+                magic_bytes[1],
+                magic_bytes[2],
+                magic_bytes[3],
+            ]);
+
+            if magic == format::RECORD_MAGIC {
+                return Ok(Some(offset));
+            }
+
+            offset += 4; // 4字节步长扫描
+        }
+
+        Ok(None)
     }
 
     /// 列出所有段文件
@@ -483,18 +541,14 @@ impl RecoveryManager {
             while offset + format::RECORD_HEADER_SIZE <= file_size {
                 match self.verify_record(&storage, offset).await {
                     Ok(true) => {
-                        // 读取长度获取下一条记录位置
-                        let length_bytes = storage.read(offset, 8).await?;
-                        let length = u64::from_be_bytes([
+                        // 读取长度获取下一条记录位置 (magic + length = 8 bytes)
+                        let length_bytes = storage.read(offset + 4, 4).await?;
+                        let length = u32::from_be_bytes([
                             length_bytes[0],
                             length_bytes[1],
                             length_bytes[2],
                             length_bytes[3],
-                            length_bytes[4],
-                            length_bytes[5],
-                            length_bytes[6],
-                            length_bytes[7],
-                        ]);
+                        ]) as u64;
 
                         // 仅验证模式下不恢复
                         if self.mode != RecoveryMode::VerifyOnly {
@@ -510,11 +564,20 @@ impl RecoveryManager {
                         offset += format::RECORD_HEADER_SIZE + length;
                     }
                     Ok(false) => {
-                        // 记录损坏，跳过到下一个可能的记录位置
-                        // 使用 8 字节对齐前进（记录长度前缀是 8 字节对齐）
-                        // 这将最坏情况复杂度从 O(n²) 降低到 O(n)
+                        // 记录损坏，查找下一个魔术位置
                         corrupted_skipped += 1;
-                        offset += 8;
+                        match self
+                            .find_next_magic(&storage, offset + 4, 64 * 1024)
+                            .await?
+                        {
+                            Some(next_offset) => {
+                                offset = next_offset;
+                            }
+                            None => {
+                                // 找不到更多记录，停止扫描
+                                break;
+                            }
+                        }
                     }
                     Err(_) => {
                         // 读取错误，停止扫描
@@ -645,6 +708,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_record() {
         use crate::storage::crc32;
+        use crate::storage::format;
 
         let temp_dir = tempdir().unwrap();
         let manager = RecoveryManager::new(temp_dir.path());
@@ -654,11 +718,13 @@ mod tests {
             .await
             .unwrap();
 
-        // 写入有效记录: [8字节长度][4字节CRC32][数据]
+        // 写入有效记录: [4B Magic][4B Length][4B CRC32][Data]
         let data = b"hello world";
         let data_crc = crc32(data);
-        let length_bytes = (data.len() as u64).to_be_bytes();
+        let magic_bytes = format::RECORD_MAGIC.to_be_bytes();
+        let length_bytes = (data.len() as u32).to_be_bytes();
         let crc_bytes = data_crc.to_be_bytes();
+        storage.append(&magic_bytes).await.unwrap();
         storage.append(&length_bytes).await.unwrap();
         storage.append(&crc_bytes).await.unwrap();
         storage.append(data).await.unwrap();
@@ -667,8 +733,8 @@ mod tests {
         let valid = manager.verify_record(&storage, 0).await.unwrap();
         assert!(valid);
 
-        // 验证损坏记录 (偏移量8处不是有效的记录头)
-        let valid = manager.verify_record(&storage, 8).await.unwrap();
+        // 验证损坏记录 (偏移量4处是长度，不是有效的记录头)
+        let valid = manager.verify_record(&storage, 4).await.unwrap();
         assert!(!valid);
     }
 }

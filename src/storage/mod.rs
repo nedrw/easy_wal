@@ -20,7 +20,9 @@ pub mod format {
     pub const SEGMENT_HEADER_SIZE: u64 = 16;
     /// 检查点最小大小 (4 + 4 + 4 = 12 bytes, 不含payload)
     pub const CHECKPOINT_HEADER_SIZE: u64 = 12;
-    /// 单条记录头大小 (8 length + 4 crc = 12 bytes)
+    /// 记录魔数
+    pub const RECORD_MAGIC: u32 = 0x57414C01;
+    /// 单条记录头大小 (4 magic + 4 length + 4 crc = 12 bytes)
     pub const RECORD_HEADER_SIZE: u64 = 12;
     /// 最大记录大小 (64MB)
     pub const MAX_RECORD_SIZE: u64 = 64 * 1024 * 1024;
