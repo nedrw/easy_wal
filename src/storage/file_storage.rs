@@ -156,6 +156,8 @@ impl Storage for FileStorage {
     /// # 实现
     /// 使用 seek + write 进行文件写入
     async fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
+        let write_end = offset + data.len() as u64;
+
         self.write_internal(offset, data).await?;
 
         // 更新统计信息
@@ -164,10 +166,9 @@ impl Storage for FileStorage {
             stats.bytes_written += data.len() as u64;
             stats.write_ops += 1;
 
-            // 更新文件大小
-            let current_size = self.size().await?;
-            if current_size > stats.size {
-                stats.size = current_size;
+            // 直接计算新大小，避免在持有锁时调用 size()
+            if write_end > stats.size {
+                stats.size = write_end;
             }
         }
 
