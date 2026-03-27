@@ -54,12 +54,11 @@ impl FileStorage {
         let path = path.as_ref().to_path_buf();
 
         // 确保父目录存在
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
+        if let Some(parent) = path.parent()
+            && !parent.exists() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| Error::Generic(format!("Failed to create directory: {}", e)))?;
             }
-        }
 
         // 打开或创建文件
         let file = OpenOptions::new()

@@ -278,6 +278,15 @@ impl SegmentManager {
         self.segments.len()
     }
 
+    /// 获取指定段的路径
+    pub fn segment_path(&self, id: u64) -> Option<PathBuf> {
+        if self.segments.iter().any(|s| s.id == id) {
+            Some(self.make_path(id))
+        } else {
+            None
+        }
+    }
+
     /// 获取配置
     pub fn config(&self) -> &SegmentConfig {
         &self.config

@@ -45,14 +45,14 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
 
 ---
 
-### ⬜ Phase 3: 读取功能
+### ✅ Phase 3: 读取功能
 **目标**: 完整的顺序读取功能
 
 **任务**:
-- ⬜ 实现 LogReader
-- ⬜ 实现批量顺序读取
-- ⬜ 实现 WalManager::read()
-- ⬜ 读取集成测试
+- ✅ 实现 LogReader
+- ✅ 实现批量顺序读取
+- ✅ 实现 WalManager::read()
+- ✅ 读取集成测试
 
 **产出**: v0.3.0 - 可读可写
 

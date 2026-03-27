@@ -116,10 +116,13 @@ impl LogWriter {
         Ok(storage)
     }
 
-    /// 写入数据
+    /// 写入数据（带长度前缀）
+    ///
+    /// 自动在数据前添加 8 字节长度前缀（大端序）。
+    /// 格式：[8字节长度][数据...]
     ///
     /// # 返回
-    /// 返回写入位置信息
+    /// 返回写入位置信息（offset 为数据开始位置，不含长度前缀）
     pub async fn write(&self, data: &[u8]) -> Result<WritePosition> {
         // 获取活跃存储
         let storage = self.get_active_storage().await?;
@@ -130,13 +133,20 @@ impl LogWriter {
             manager.active_id()
         };
 
+        // 写入长度前缀
+        let length_bytes = (data.len() as u64).to_be_bytes();
+        let _offset = storage.append(&length_bytes).await?;
+
         // 写入数据
-        let offset = storage.append(data).await?;
+        let data_offset = storage.append(data).await?;
+
+        // 计算总长度（含前缀）
+        let total_len = 8 + data.len() as u64;
 
         // 更新段大小，检查是否需要轮转
         let should_rotate = {
             let mut manager = self.segment_manager.write().await;
-            manager.update_active_size(data.len() as u64)
+            manager.update_active_size(total_len)
         };
 
         // 如果需要轮转，清除活跃存储，强制下次创建新段
@@ -152,7 +162,7 @@ impl LogWriter {
 
         Ok(WritePosition {
             segment_id,
-            offset,
+            offset: data_offset, // 返回数据开始位置（不含前缀）
             length: data.len() as u64,
         })
     }
@@ -228,7 +238,7 @@ mod tests {
         let pos = writer.write(b"hello world").await.unwrap();
 
         assert_eq!(pos.segment_id, 1);
-        assert_eq!(pos.offset, 0);
+        assert_eq!(pos.offset, 8); // data starts after 8-byte length prefix
         assert_eq!(pos.length, 11);
     }
 

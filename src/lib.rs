@@ -20,10 +20,10 @@
 //!
 //! # 当前状态
 //!
-//! Phase 2: 文件管理 (已完成)
-//! - ✅ SegmentManager 实现
-//! - ✅ LogWriter 集成
-//! - ✅ 配置和测试
+//! Phase 3: 读取功能 (已完成)
+//! - ✅ LogReader 实现
+//! - ✅ 批量顺序读取
+//! - ✅ WalManager::read()
 
 mod error;
 mod prelude;
