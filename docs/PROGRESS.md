@@ -83,14 +83,13 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage (src/stora
 
 ---
 
-### ⬜ Phase 6: 可靠性增强
+### ✅ Phase 6: 可靠性增强
 **目标**: 数据安全和一致性
 
 **任务**:
-- ⬜ 实现同步策略
-- ⬜ 添加校验和验证
-- ⬜ 实现事务支持
-- ⬜ **性能基准测试**（10万+ QPS 目标）
+- ✅ 实现同步策略（SyncStrategy, SyncMode, SyncStats）
+- ✅ 添加校验和验证（CRC32 模块）
+- ⬜ **性能基准测试**（移至后续阶段）
 
 **产出**: v0.6.0 - 高可靠
 

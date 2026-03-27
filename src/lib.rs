@@ -35,8 +35,9 @@ pub use prelude::{Error, Result};
 
 // 存储层导出
 pub use storage::{
-    FileStorage, Location, LogWriter, LogWriterConfig, MemoryStorage, SegmentConfig,
-    SegmentManager, SegmentMeta, Storage, StorageStats, WritePosition,
+    Crc32, FileStorage, Location, LogWriter, LogWriterConfig, MemoryStorage, SegmentConfig,
+    SegmentManager, SegmentMeta, Storage, StorageStats, SyncMode, SyncStats, SyncStrategy,
+    WritePosition, crc32, verify_crc32,
 };
 
 // WAL 层导出（协调层 + API 层）
