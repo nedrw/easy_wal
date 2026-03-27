@@ -1,7 +1,7 @@
 # 代码 Review 问题记录
 
 **Review 日期**: 2025-01-09  
-**更新日期**: 2025-01-15
+**更新日期**: 2025-01-16
 
 ---
 
@@ -19,14 +19,22 @@
 
 ---
 
-### 2. SyncStrategy 架构（架构讨论中）
+### 2. SyncStrategy 未实际集成
 
-**位置**: `src/wal/sync_strategy.rs`, `src/storage/log_writer.rs`
+**位置**: `src/wal/sync_strategy.rs`, `src/storage/log_writer.rs`, `src/wal/wal_manager.rs`
 
-**当前状态**: `SyncStrategy` 已在 `src/wal/` 但 `LogWriter` 使用简单 `bool sync_on_write`
+**当前状态**: `SyncStrategy` 已在 `src/wal/` 完整实现（包含 None/FsyncOnWrite/Periodic/Batch 四种模式），但 `LogWriter` 仍使用简单 `bool sync_on_write`，`SyncStrategy` 未被任何组件使用。
 
-**路径 A - 保持分离（推荐）**: `SyncStrategy` 在 API 层使用，`LogWriter` 保持简单
-**路径 B - 集成**: 将 `sync_on_write: bool` 改为 `sync_mode: SyncMode`
+**决策**: 保持现状（路径 A）
+- `LogWriter` 保持简单，仅使用 `sync_on_write: bool`
+- `SyncStrategy` 保留在 API 层，供上层应用自行使用（如需复杂策略，在调用方管理）
+
+**原因**: 
+- 同步策略更适合在应用层控制
+- 保持底层组件简单，避免过度设计
+- 当前 `sync_on_write` 模式已满足大部分场景
+
+**状态**: 已实现但不集成 ✅
 
 ---
 
@@ -48,9 +56,8 @@
 | 优先级 | 问题 | 修复复杂度 |
 |--------|------|------------|
 | P1 | 性能基准测试 | 中 |
-| P2 | SyncStrategy 集成决策 | 低（决策） |
-| P3 | 测试覆盖不足 | 中 |
+| P2 | 测试覆盖不足 | 中 |
 
 ---
 
-*Review 更新 - 2025-01-15*
+*Review 更新 - 2025-01-16*
