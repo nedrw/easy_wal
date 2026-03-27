@@ -97,7 +97,7 @@ impl SegmentManager {
         }
 
         // 扫描现有段文件
-        let segments = Self::scan_segments(&config)?;
+        let mut segments = Self::scan_segments(&config)?;
 
         // 确定当前活跃段 ID
         let active_id = segments.iter().map(|s| s.id).max().unwrap_or(0);
@@ -106,6 +106,9 @@ impl SegmentManager {
             .find(|s| s.id == active_id)
             .map(|s| s.size)
             .unwrap_or(0);
+
+        // 修复活跃段的 is_active 标记
+        Self::fix_active_segment(&mut segments, active_id);
 
         Ok(Self {
             config,
@@ -160,7 +163,7 @@ impl SegmentManager {
                 id,
                 path,
                 size,
-                is_active: false,
+                is_active: false, // 临时设为 false，后续在 new() 中修正
             });
         }
 
@@ -168,6 +171,13 @@ impl SegmentManager {
         segments.sort_by_key(|s| s.id);
 
         Ok(segments)
+    }
+
+    /// 修复扫描结果中活跃段的 is_active 标记
+    fn fix_active_segment(segments: &mut Vec<SegmentMeta>, active_id: u64) {
+        for seg in segments.iter_mut() {
+            seg.is_active = seg.id == active_id;
+        }
     }
 
     /// 获取当前活跃段路径

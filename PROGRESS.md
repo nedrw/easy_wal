@@ -7,7 +7,7 @@
 ```
 Layer 4: API 层        - WalManager, WalBuilder
 Layer 3: 协调层        - WriteCoordinator, ReadCoordinator, RecoveryManager
-Layer 2: 组件层        - LogWriter, LogReader, IndexManager, SegmentManager
+Layer 2: 组件层        - LogWriter, LogReader, SegmentManager
 Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
 ```
 
@@ -26,6 +26,7 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
 - ✅ 添加文件大小监控
 - ✅ 存储层单元测试
 - ✅ 并发读写测试
+- ✅ 存储层集成测试（独立测试文件）
 
 **产出**: v0.1.0 - 可靠的存储层 ✅
 
@@ -38,48 +39,39 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
 - ✅ 实现 SegmentManager
 - ✅ 集成到 LogWriter
 - ✅ 添加配置和测试
+- ✅ 集成测试验证
 
 **产出**: v0.2.0 - 支持文件轮转 ✅
 
 ---
 
-### ⬜ Phase 3: 索引管理
-**目标**: 实现内存索引，快速读取
-
-**任务**:
-- ⬜ 实现 IndexManager
-- ⬜ 集成到 WalManager
-- ⬜ 优化索引内存占用
-
-**产出**: v0.3.0 - 支持快速读取
-
----
-
-### ⬜ Phase 4: 读取功能
-**目标**: 完整的读取功能
+### ⬜ Phase 3: 读取功能
+**目标**: 完整的顺序读取功能
 
 **任务**:
 - ⬜ 实现 LogReader
-- ⬜ 实现批量读取
+- ⬜ 实现批量顺序读取
 - ⬜ 实现 WalManager::read()
+- ⬜ 读取集成测试
 
-**产出**: v0.4.0 - 可读可写
+**产出**: v0.3.0 - 可读可写
 
 ---
 
-### ⬜ Phase 5: 恢复机制
+### ⬜ Phase 4: 恢复机制
 **目标**: 崩溃恢复
 
 **任务**:
 - ⬜ 实现 RecoveryManager
+- ⬜ 实现 Checkpoint 机制
 - ⬜ 处理异常情况
 - ⬜ 添加恢复测试
 
-**产出**: v0.5.0 - 支持崩溃恢复
+**产出**: v0.4.0 - 支持崩溃恢复
 
 ---
 
-### ⬜ Phase 6: 性能优化
+### ⬜ Phase 5: 性能优化
 **目标**: 提升性能（10万+ QPS）
 
 **任务**:
@@ -87,11 +79,11 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
 - ⬜ 添加缓冲机制
 - ⬜ 性能测试和调优
 
-**产出**: v0.6.0 - 高性能
+**产出**: v0.5.0 - 高性能
 
 ---
 
-### ⬜ Phase 7: 可靠性增强
+### ⬜ Phase 6: 可靠性增强
 **目标**: 数据安全和一致性
 
 **任务**:
@@ -99,11 +91,11 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
 - ⬜ 添加校验和验证
 - ⬜ 实现事务支持
 
-**产出**: v0.7.0 - 高可靠
+**产出**: v0.6.0 - 高可靠
 
 ---
 
-### ⬜ Phase 8: 监控和运维
+### ⬜ Phase 7: 监控和运维
 **目标**: 生产环境运维
 
 **任务**:
@@ -111,11 +103,11 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
 - ⬜ 添加运维工具
 - ⬜ 完善日志和错误处理
 
-**产出**: v0.8.0 - 可观测
+**产出**: v0.7.0 - 可观测
 
 ---
 
-### ⬜ Phase 9: 文档和示例
+### ⬜ Phase 8: 文档和示例
 **目标**: 完善文档
 
 **任务**:
@@ -123,11 +115,11 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
 - ⬜ 编写使用文档
 - ⬜ 编写教程和示例
 
-**产出**: v0.9.0 - 文档完善
+**产出**: v0.8.0 - 文档完善
 
 ---
 
-### ⬜ Phase 10: 压力和兼容性测试
+### ⬜ Phase 9: 压力和兼容性测试
 **目标**: 生产验证
 
 **任务**:
@@ -135,6 +127,37 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
 - ⬜ 兼容性测试
 - ⬜ 发布准备
 
-**产出**: v1.0.0 - 生产就绪
+**产出**: v0.9.0 - 生产就绪
 
 ---
+
+## 📝 设计决策记录
+
+### 索引不属于 WAL
+**日期**: 2025-01-20
+
+**决策**: 移除 Phase 3 索引管理
+
+**理由**:
+- WAL 的核心价值是持久化和恢复，不是随机读取
+- 主流实现（RocksDB、PostgreSQL）中，索引在 WAL 之上的层（如 MemTable）
+- 如果需要按 key 查找，应该由业务层实现，不应该耦合在 WAL 中
+
+**结论**: WAL 保持简单 - 顺序写入，顺序/批量读取
+
+---
+
+### 测试超时问题
+**日期**: 2025-01-20
+
+**问题描述**:
+部分测试存在超时问题，可能原因：
+1. `FileStorage::write()` 方法中调用 `self.size().await?` 导致死锁
+2. `RwLock` 在持有写锁时尝试获取另一个锁
+
+**待修复的测试**:
+- `storage::file_storage::tests::test_write_and_read`
+- `tests/storage_integration.rs::test_file_storage_read_batch`
+- 其他并发相关测试
+
+**临时解决方案**: 测试套件拆分运行，后续修复锁机制

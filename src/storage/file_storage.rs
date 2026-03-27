@@ -247,8 +247,15 @@ impl Storage for FileStorage {
         indexed_data.sort_by_key(|&(_, (&offset, _))| offset);
 
         // 写入数据
-        for (_, (&offset, data)) in indexed_data {
+        let mut max_offset: u64 = 0;
+        for item in indexed_data.iter() {
+            let offset = *item.1.0;
+            let data = *item.1.1;
             self.write_internal(offset, data).await?;
+            let end_offset = offset + data.len() as u64;
+            if end_offset > max_offset {
+                max_offset = end_offset;
+            }
         }
 
         // 更新统计信息
@@ -258,9 +265,8 @@ impl Storage for FileStorage {
             stats.write_ops += 1;
 
             // 更新文件大小
-            let current_size = self.size().await?;
-            if current_size > stats.size {
-                stats.size = current_size;
+            if max_offset > stats.size {
+                stats.size = max_offset;
             }
         }
 
@@ -283,13 +289,11 @@ impl Storage for FileStorage {
     }
 
     /// 获取文件大小
+    ///
+    /// 使用内部统计信息，避免频繁系统调用
     async fn size(&self) -> Result<u64> {
-        let file = self.file.read().await;
-        let metadata = file
-            .metadata()
-            .await
-            .map_err(|e| Error::Generic(format!("Failed to get metadata: {}", e)))?;
-        Ok(metadata.len())
+        let stats = self.stats.read().await;
+        Ok(stats.size)
     }
 
     /// 截断文件到指定大小
@@ -298,12 +302,20 @@ impl Storage for FileStorage {
     /// 使用 set_len 方法截断文件
     async fn truncate(&self, length: u64) -> Result<()> {
         let file = self.file.write().await;
+
+        // 先截断文件
         file.set_len(length)
             .await
             .map_err(|e| Error::Generic(format!("Truncate failed: {}", e)))?;
 
-        // 更新统计信息
+        // 同步 trunc 操作到磁盘
+        file.sync_all()
+            .await
+            .map_err(|e| Error::Generic(format!("Sync after truncate failed: {}", e)))?;
+
         drop(file);
+
+        // 更新统计信息
         {
             let mut stats = self.stats.write().await;
             stats.size = length;
