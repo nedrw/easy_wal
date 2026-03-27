@@ -2,8 +2,6 @@
 //!
 //! 提供不同的数据同步策略，用于在性能和数据安全性之间取得平衡。
 
-use tokio::sync::RwLock;
-
 /// 同步模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
@@ -38,8 +36,6 @@ pub enum SyncMode {
 pub struct SyncStats {
     /// 总同步次数
     pub sync_count: u64,
-    /// 总同步字节数
-    pub synced_bytes: u64,
     /// 总同步耗时（毫秒）
     pub sync_time_ms: u64,
     /// 最后同步时间戳
@@ -53,20 +49,10 @@ impl SyncStats {
     }
 
     /// 记录一次同步
-    pub fn record(&mut self, bytes: u64, duration_ms: u64) {
+    pub fn record(&mut self, duration_ms: u64) {
         self.sync_count += 1;
-        self.synced_bytes += bytes;
         self.sync_time_ms += duration_ms;
         self.last_sync_at = Some(std::time::Instant::now());
-    }
-
-    /// 获取平均同步大小（字节）
-    pub fn avg_sync_size(&self) -> u64 {
-        if self.sync_count == 0 {
-            0
-        } else {
-            self.synced_bytes / self.sync_count
-        }
     }
 
     /// 获取平均同步延迟（毫秒）
@@ -79,31 +65,26 @@ impl SyncStats {
     }
 }
 
-/// 同步策略上下文
+/// 同步上下文
 ///
 /// 跟踪同步状态，决定何时执行同步操作。
-pub struct SyncStrategy {
+/// 由 WriteCoordinator 持有和使用。
+pub struct SyncContext {
     mode: SyncMode,
-    /// 待同步字节数
-    pending_bytes: u64,
-    /// 最后同步时间（用于周期同步）
-    last_sync_time: std::time::Instant,
     /// 批量写入计数器
     batch_counter: u64,
-    /// 统计信息
-    stats: RwLock<SyncStats>,
+    /// 最后同步时间（用于周期同步）
+    last_sync_time: std::time::Instant,
 }
 
-impl SyncStrategy {
-    /// 创建新的同步策略
+impl SyncContext {
+    /// 创建新的同步上下文
     pub fn new(mode: SyncMode) -> Self {
         let now = std::time::Instant::now();
         Self {
             mode,
-            pending_bytes: 0,
-            last_sync_time: now,
             batch_counter: 0,
-            stats: RwLock::new(SyncStats::new()),
+            last_sync_time: now,
         }
     }
 
@@ -122,82 +103,99 @@ impl SyncStrategy {
         self.mode
     }
 
-    /// 获取统计信息
-    pub async fn stats(&self) -> SyncStats {
-        self.stats.read().await.clone()
-    }
-
-    /// 通知写入完成
+    /// 设置同步模式（运行时切换）
     ///
-    /// # 返回
-    /// - `Some(bytes)` 表示需要同步，返回待同步字节数
-    /// - `None` 表示不需要同步
-    pub async fn on_write(&mut self, bytes: u64) -> Option<u64> {
-        self.pending_bytes += bytes;
-        self.batch_counter += 1;
-
-        match self.mode {
-            SyncMode::None => None,
-
-            SyncMode::FsyncOnWrite => Some(self.pending_bytes),
-
-            SyncMode::Batch { batch_size } => {
-                if self.batch_counter >= batch_size {
-                    self.batch_counter = 0;
-                    Some(self.pending_bytes)
-                } else {
-                    None
-                }
-            }
-
-            SyncMode::Periodic { interval_ms } => {
-                let elapsed = self.last_sync_time.elapsed().as_millis() as u64;
-                if elapsed >= interval_ms {
-                    self.last_sync_time = std::time::Instant::now();
-                    Some(self.pending_bytes)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
-    /// 记录同步完成
-    pub async fn on_synced(&mut self, bytes: u64, duration_ms: u64) {
-        self.pending_bytes = self.pending_bytes.saturating_sub(bytes);
-
-        let mut stats = self.stats.write().await;
-        stats.record(bytes, duration_ms);
-    }
-
-    /// 强制重置状态
-    pub async fn reset(&mut self) {
-        self.pending_bytes = 0;
+    /// 切换模式时会重置内部状态：
+    /// - 批量计数器清零
+    /// - 同步计时器重置
+    /// - 保留历史统计信息（由 SyncStats 维护）
+    pub fn set_mode(&mut self, mode: SyncMode) {
+        self.mode = mode;
         self.batch_counter = 0;
         self.last_sync_time = std::time::Instant::now();
     }
 
-    /// 获取待同步字节数
-    pub fn pending_bytes(&self) -> u64 {
-        self.pending_bytes
+    /// 单条写入后调用，返回是否需要 sync
+    pub fn on_write(&mut self) -> bool {
+        match self.mode {
+            SyncMode::None => false,
+
+            SyncMode::FsyncOnWrite => true,
+
+            SyncMode::Batch { batch_size } => {
+                self.batch_counter += 1;
+                if self.batch_counter >= batch_size {
+                    self.batch_counter = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+
+            SyncMode::Periodic { .. } => false, // 不在 on_write 触发
+        }
+    }
+
+    /// 批量写入后调用，返回是否需要 sync
+    pub fn on_batch(&mut self, count: u64) -> bool {
+        match self.mode {
+            SyncMode::None => false,
+
+            SyncMode::FsyncOnWrite => true,
+
+            SyncMode::Batch { batch_size } => {
+                self.batch_counter += count;
+                if self.batch_counter >= batch_size {
+                    self.batch_counter %= batch_size;
+                    true
+                } else {
+                    false
+                }
+            }
+
+            SyncMode::Periodic { .. } => false, // 不在 on_batch 触发
+        }
+    }
+
+    /// Periodic 定时检查（由外部定时任务调用）
+    pub fn should_periodic_sync(&self) -> bool {
+        match self.mode {
+            SyncMode::Periodic { interval_ms } => {
+                self.last_sync_time.elapsed().as_millis() as u64 >= interval_ms
+            }
+            _ => false,
+        }
+    }
+
+    /// 记录同步完成
+    pub fn on_synced(&mut self) {
+        self.last_sync_time = std::time::Instant::now();
+    }
+
+    /// 强制重置状态
+    pub fn reset(&mut self) {
+        self.batch_counter = 0;
+        self.last_sync_time = std::time::Instant::now();
     }
 }
 
-impl Default for SyncStrategy {
+impl Default for SyncContext {
     fn default() -> Self {
         Self::new(SyncMode::None)
     }
 }
 
-impl std::fmt::Debug for SyncStrategy {
+impl std::fmt::Debug for SyncContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SyncStrategy")
+        f.debug_struct("SyncContext")
             .field("mode", &self.mode)
-            .field("pending_bytes", &self.pending_bytes)
             .field("batch_counter", &self.batch_counter)
             .finish()
     }
 }
+
+// 保留 SyncStrategy 作为 SyncContext 的类型别名，用于向后兼容
+pub type SyncStrategy = SyncContext;
 
 #[cfg(test)]
 mod tests {
@@ -205,74 +203,106 @@ mod tests {
 
     #[test]
     fn test_sync_mode_none() {
-        let strategy = SyncStrategy::new(SyncMode::None);
-        assert_eq!(strategy.mode(), SyncMode::None);
-        assert_eq!(strategy.pending_bytes(), 0);
+        let context = SyncContext::new(SyncMode::None);
+        assert_eq!(context.mode(), SyncMode::None);
     }
 
     #[tokio::test]
     async fn test_fsync_on_write() {
-        let mut strategy = SyncStrategy::new(SyncMode::FsyncOnWrite);
+        let mut context = SyncContext::new(SyncMode::FsyncOnWrite);
 
         // 每次写入都应该触发同步
-        let should_sync = strategy.on_write(100).await;
-        assert!(should_sync.is_some());
-        assert_eq!(should_sync.unwrap(), 100);
+        let should_sync = context.on_write();
+        assert!(should_sync);
 
-        strategy.on_synced(100, 5).await;
-        assert_eq!(strategy.pending_bytes(), 0);
+        context.on_synced();
     }
 
     #[tokio::test]
     async fn test_batch_sync() {
-        let mut strategy = SyncStrategy::batch(3);
+        let mut context = SyncContext::batch(3);
 
         // 前两次写入不触发同步
-        assert!(strategy.on_write(10).await.is_none());
-        assert!(strategy.on_write(20).await.is_none());
+        assert!(!context.on_write());
+        assert!(!context.on_write());
 
         // 第三次触发
-        let should_sync = strategy.on_write(30).await;
-        assert!(should_sync.is_some());
+        let should_sync = context.on_write();
+        assert!(should_sync);
 
-        strategy.on_synced(60, 5).await;
-        assert_eq!(strategy.batch_counter, 0);
-        assert_eq!(strategy.pending_bytes, 0);
+        context.on_synced();
+        assert_eq!(context.batch_counter, 0);
+    }
+
+    #[tokio::test]
+    async fn test_batch_sync_with_on_batch() {
+        let mut context = SyncContext::batch(10);
+
+        // 批量写入 3 条
+        assert!(!context.on_batch(3));
+        assert_eq!(context.batch_counter, 3);
+
+        // 批量写入 5 条
+        assert!(!context.on_batch(5));
+        assert_eq!(context.batch_counter, 8);
+
+        // 批量写入 4 条，总共 12 条，超过 batch_size=10
+        let should_sync = context.on_batch(4);
+        assert!(should_sync);
+        assert_eq!(context.batch_counter, 2); // 12 % 10 = 2
+
+        context.on_synced();
     }
 
     #[tokio::test]
     async fn test_periodic_sync() {
-        let mut strategy = SyncStrategy::periodic(100); // 100ms interval
+        let mut context = SyncContext::periodic(100); // 100ms interval
 
-        // 第一次写入（时间太短，不触发）
-        assert!(strategy.on_write(100).await.is_none());
+        // 刚创建时不应该触发
+        assert!(!context.should_periodic_sync());
 
-        // 模拟时间流逝（需要实际等待或 mock）
-        // 这里只测试初始化
-        assert_eq!(strategy.pending_bytes(), 100);
+        // 手动设置 last_sync_time 为很久以前
+        context.last_sync_time = std::time::Instant::now() - std::time::Duration::from_millis(150);
+        assert!(context.should_periodic_sync());
+
+        // 同步后重置时间
+        context.on_synced();
+        assert!(!context.should_periodic_sync());
     }
 
     #[tokio::test]
-    async fn test_stats() {
-        let mut strategy = SyncStrategy::new(SyncMode::FsyncOnWrite);
+    async fn test_periodic_does_not_trigger_on_write() {
+        let mut context = SyncContext::periodic(100);
 
-        strategy.on_write(100).await;
-        strategy.on_synced(100, 5).await;
-
-        let stats = strategy.stats().await;
-        assert_eq!(stats.sync_count, 1);
-        assert_eq!(stats.synced_bytes, 100);
-        assert_eq!(stats.sync_time_ms, 5);
+        // Periodic 模式下 on_write 不应该触发同步
+        assert!(!context.on_write());
+        assert!(!context.on_write());
+        assert!(!context.on_write());
     }
 
     #[tokio::test]
     async fn test_reset() {
-        let mut strategy = SyncStrategy::new(SyncMode::FsyncOnWrite);
+        let mut context = SyncContext::batch(10);
 
-        strategy.on_write(100).await;
-        assert_eq!(strategy.pending_bytes(), 100);
+        context.on_write();
+        context.on_write();
+        assert_eq!(context.batch_counter, 2);
 
-        strategy.reset().await;
-        assert_eq!(strategy.pending_bytes(), 0);
+        context.reset();
+        assert_eq!(context.batch_counter, 0);
+    }
+
+    #[test]
+    fn test_sync_stats() {
+        let mut stats = SyncStats::new();
+
+        stats.record(5);
+        assert_eq!(stats.sync_count, 1);
+        assert_eq!(stats.sync_time_ms, 5);
+
+        stats.record(10);
+        assert_eq!(stats.sync_count, 2);
+        assert_eq!(stats.sync_time_ms, 15);
+        assert_eq!(stats.avg_sync_latency(), 7); // 15 / 2 = 7
     }
 }

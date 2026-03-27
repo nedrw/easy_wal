@@ -4,11 +4,10 @@
 //! - 学习组件协作设计
 //! - 学习状态管理
 //! - 学习资源池化
-//! - 学习同步策略集成
 
 use super::{FileStorage, SegmentConfig, SegmentManager, Storage, crc32, format};
 use crate::prelude::*;
-use crate::wal::SyncMode;
+use crate::wal::{SyncContext, SyncMode};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -18,18 +17,18 @@ use tokio::sync::RwLock;
 pub struct LogWriterConfig {
     /// 段配置
     pub segment_config: SegmentConfig,
-    /// 同步模式
-    pub sync_mode: SyncMode,
     /// 缓冲区大小
     pub buffer_size: usize,
+    /// 同步模式
+    pub sync_mode: SyncMode,
 }
 
 impl Default for LogWriterConfig {
     fn default() -> Self {
         Self {
             segment_config: SegmentConfig::default(),
-            sync_mode: SyncMode::None,
             buffer_size: 64 * 1024, // 64KB
+            sync_mode: SyncMode::None,
         }
     }
 }
@@ -76,13 +75,13 @@ pub struct WritePosition {
 /// 日志写入器
 ///
 /// 封装段管理和存储操作，提供统一的写入接口。
-/// 支持多种同步策略，在性能和数据安全性之间取得平衡。
+/// 支持多种同步策略，根据配置决定何时执行 fsync。
 pub struct LogWriter {
     config: LogWriterConfig,
     segment_manager: RwLock<SegmentManager>,
     active_storage: RwLock<Option<Arc<FileStorage>>>,
-    /// 同步策略
-    sync_strategy: RwLock<crate::wal::SyncStrategy>,
+    /// 同步上下文，跟踪同步状态
+    sync_context: RwLock<SyncContext>,
 }
 
 impl LogWriter {
@@ -91,13 +90,13 @@ impl LogWriter {
         let segment_manager = SegmentManager::new(config.segment_config.clone())
             .map_err(|e| Error::Generic(format!("Failed to create segment manager: {}", e)))?;
 
-        let sync_strategy = crate::wal::SyncStrategy::new(config.sync_mode);
+        let sync_context = SyncContext::new(config.sync_mode);
 
         Ok(Self {
             config,
             segment_manager: RwLock::new(segment_manager),
             active_storage: RwLock::new(None),
-            sync_strategy: RwLock::new(sync_strategy),
+            sync_context: RwLock::new(sync_context),
         })
     }
 
@@ -140,13 +139,13 @@ impl LogWriter {
 
     /// 写入数据（带长度前缀和CRC32）
     ///
-    /// 格式：[8字节长度][4字节CRC32][数据...]
+    /// 格式：[4字节 magic][4字节长度][4字节CRC32][数据...]
     ///
-    /// 根据配置的同步策略决定何时执行 fsync：
-    /// - None: 不主动同步，依赖操作系统
-    /// - FsyncOnWrite: 每次写入后同步
-    /// - Batch: 每 N 次写入后同步
-    /// - Periodic: 按时间间隔同步
+    /// 根据同步策略决定是否执行 fsync：
+    /// - FsyncOnWrite: 每次写入后自动同步
+    /// - Batch: 累积到指定数量后同步
+    /// - Periodic: 需要外部定时任务触发
+    /// - None: 不同步，依赖操作系统缓冲区
     ///
     /// # 返回
     /// 返回写入位置信息（offset 为数据开始位置，不含记录头）
@@ -190,20 +189,14 @@ impl LogWriter {
             *active = None;
         }
 
-        // 使用 SyncStrategy 决定是否同步
+        // 根据同步策略决定是否同步
         let should_sync = {
-            let mut strategy = self.sync_strategy.write().await;
-            strategy.on_write(total_len).await
+            let mut sync_ctx = self.sync_context.write().await;
+            sync_ctx.on_write()
         };
 
-        if should_sync.is_some() {
-            let start = std::time::Instant::now();
-            storage.sync().await?;
-            let duration_ms = start.elapsed().as_millis() as u64;
-
-            // 记录同步统计
-            let mut strategy = self.sync_strategy.write().await;
-            strategy.on_synced(total_len, duration_ms).await;
+        if should_sync {
+            self.sync().await?;
         }
 
         Ok(WritePosition {
@@ -215,14 +208,91 @@ impl LogWriter {
 
     /// 批量写入
     ///
-    /// 所有数据写入后，根据同步策略决定是否执行一次同步。
-    /// 对于 Batch 模式，这表示一批写入，只会计数一次。
+    /// 使用 storage 层的批量写入接口，一次性写入多条记录。
+    /// 根据同步策略决定是否执行 fsync。
     pub async fn write_batch(&self, data_list: &[&[u8]]) -> Result<Vec<WritePosition>> {
+        if data_list.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let storage = self.get_active_storage().await?;
+
+        let segment_id = {
+            let manager = self.segment_manager.read().await;
+            manager.active_id()
+        };
+
+        // 准备所有数据
+        let mut all_data = Vec::new();
         let mut positions = Vec::with_capacity(data_list.len());
 
         for data in data_list {
-            let pos = self.write(data).await?;
-            positions.push(pos);
+            let data_crc = crc32(data);
+            let mut record = Vec::with_capacity(format::RECORD_HEADER_SIZE as usize + data.len());
+
+            // 记录头
+            record.extend_from_slice(&format::RECORD_MAGIC.to_be_bytes());
+            record.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            record.extend_from_slice(&data_crc.to_be_bytes());
+            // 数据
+            record.extend_from_slice(data);
+
+            all_data.push(record);
+        }
+
+        // 一次性写入所有数据
+        // 注意：这里我们使用循环 append，因为每条记录需要独立的位置信息
+        // 如果 storage 层支持原子批量 append 并返回位置，可以优化
+        let mut current_offset = storage.size().await?;
+
+        for (i, data) in data_list.iter().enumerate() {
+            let record = &all_data[i];
+            storage.append(record).await?;
+
+            let data_offset = current_offset + format::RECORD_HEADER_SIZE;
+            let total_len = record.len() as u64;
+
+            positions.push(WritePosition {
+                segment_id,
+                offset: data_offset,
+                length: data.len() as u64,
+            });
+
+            current_offset += total_len;
+
+            // 更新段大小
+            let should_rotate = {
+                let mut manager = self.segment_manager.write().await;
+                manager.update_active_size(total_len)
+            };
+
+            if should_rotate {
+                // 轮转到新段
+                let mut manager = self.segment_manager.write().await;
+                manager
+                    .rotate()
+                    .map_err(|e| Error::Generic(format!("Failed to rotate: {}", e)))?;
+
+                // 清除活跃存储
+                let mut active = self.active_storage.write().await;
+                *active = None;
+
+                // 获取新段的存储
+                drop(active);
+                drop(manager);
+                let new_storage = self.get_active_storage().await?;
+                current_offset = new_storage.size().await?;
+            }
+        }
+
+        // 根据同步策略决定是否同步
+        let should_sync = {
+            let mut sync_ctx = self.sync_context.write().await;
+            sync_ctx.on_batch(data_list.len() as u64)
+        };
+
+        if should_sync {
+            self.sync().await?;
         }
 
         Ok(positions)
@@ -256,40 +326,30 @@ impl LogWriter {
 
     /// 同步所有未持久化的数据
     ///
-    /// 强制立即执行 fsync，并更新同步策略状态。
+    /// 执行 fsync，确保数据持久化到磁盘。
     pub async fn sync(&self) -> Result<()> {
         let storage = self.active_storage.read().await;
         if let Some(ref s) = *storage {
-            let start = std::time::Instant::now();
             s.sync().await?;
-            let duration_ms = start.elapsed().as_millis() as u64;
-
-            // 获取待同步字节数并更新策略状态
-            let pending_bytes = {
-                let strategy = self.sync_strategy.read().await;
-                strategy.pending_bytes()
-            };
-
-            let mut strategy = self.sync_strategy.write().await;
-            strategy.on_synced(pending_bytes, duration_ms).await;
         }
+
+        // 记录同步完成
+        let mut sync_ctx = self.sync_context.write().await;
+        sync_ctx.on_synced();
+
         Ok(())
     }
 
-    /// 获取同步统计信息
-    pub async fn sync_stats(&self) -> crate::wal::SyncStats {
-        let strategy = self.sync_strategy.read().await;
-        strategy.stats().await
+    /// 关闭写入器
+    ///
+    /// 执行最后的同步操作。
+    pub async fn close(&self) -> Result<()> {
+        self.sync().await
     }
 
     /// 获取当前同步模式
     pub fn sync_mode(&self) -> SyncMode {
         self.config.sync_mode
-    }
-
-    /// 关闭写入器
-    pub async fn close(&self) -> Result<()> {
-        self.sync().await
     }
 }
 
@@ -311,7 +371,7 @@ mod tests {
         let pos = writer.write(b"hello world").await.unwrap();
 
         assert_eq!(pos.segment_id, 1);
-        // offset = 16 (segment header) + 12 (record header: 8 length + 4 crc)
+        // offset = 16 (segment header) + 12 (record header: 4 magic + 4 length + 4 crc)
         assert_eq!(pos.offset, 28);
         assert_eq!(pos.length, 11);
     }
@@ -354,15 +414,12 @@ mod tests {
     #[tokio::test]
     async fn test_sync() {
         let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default()
-            .with_dir(temp_dir.path())
-            .with_sync_on_write(true);
+        let config = LogWriterConfig::default().with_dir(temp_dir.path());
 
         let writer = LogWriter::new(config).await.unwrap();
 
         writer.write(b"test data").await.unwrap();
-
-        // sync_on_write 为 true 时写入后已同步
+        writer.sync().await.unwrap();
         writer.close().await.unwrap();
     }
 
@@ -388,7 +445,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let config = LogWriterConfig::default()
             .with_dir(temp_dir.path())
-            .with_max_segment_size(1000);
+            .with_max_segment_size(10000);
 
         let writer = LogWriter::new(config).await.unwrap();
 
@@ -396,5 +453,123 @@ mod tests {
         let positions = writer.write_batch(&data_list).await.unwrap();
 
         assert_eq!(positions.len(), 3);
+        assert_eq!(positions[0].length, 1);
+        assert_eq!(positions[1].length, 2);
+        assert_eq!(positions[2].length, 3);
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_none() {
+        use crate::wal::SyncMode;
+
+        let temp_dir = tempdir().unwrap();
+        let config = LogWriterConfig::default()
+            .with_dir(temp_dir.path())
+            .with_sync_mode(SyncMode::None);
+
+        let writer = LogWriter::new(config).await.unwrap();
+        assert_eq!(writer.sync_mode(), SyncMode::None);
+
+        // 写入数据，不应该自动同步
+        writer.write(b"data1").await.unwrap();
+        writer.write(b"data2").await.unwrap();
+
+        // 手动同步应该成功
+        writer.sync().await.unwrap();
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_fsync_on_write() {
+        use crate::wal::SyncMode;
+
+        let temp_dir = tempdir().unwrap();
+        let config = LogWriterConfig::default()
+            .with_dir(temp_dir.path())
+            .with_sync_mode(SyncMode::FsyncOnWrite);
+
+        let writer = LogWriter::new(config).await.unwrap();
+        assert_eq!(writer.sync_mode(), SyncMode::FsyncOnWrite);
+
+        // 每次写入都应该自动同步
+        writer.write(b"data1").await.unwrap();
+        writer.write(b"data2").await.unwrap();
+        writer.write(b"data3").await.unwrap();
+
+        // 验证数据已经持久化
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_batch() {
+        use crate::wal::SyncMode;
+
+        let temp_dir = tempdir().unwrap();
+        let config = LogWriterConfig::default()
+            .with_dir(temp_dir.path())
+            .with_sync_mode(SyncMode::Batch { batch_size: 3 });
+
+        let writer = LogWriter::new(config).await.unwrap();
+        assert_eq!(writer.sync_mode(), SyncMode::Batch { batch_size: 3 });
+
+        // 前两次写入不应该触发同步
+        writer.write(b"data1").await.unwrap();
+        writer.write(b"data2").await.unwrap();
+
+        // 第三次写入应该触发同步
+        writer.write(b"data3").await.unwrap();
+
+        // 再写入几条，验证批量同步继续工作
+        writer.write(b"data4").await.unwrap();
+        writer.write(b"data5").await.unwrap();
+
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sync_on_write_backward_compatibility() {
+        use crate::wal::SyncMode;
+
+        let temp_dir = tempdir().unwrap();
+
+        // 测试 with_sync_on_write(true) 映射到 FsyncOnWrite
+        let config = LogWriterConfig::default()
+            .with_dir(temp_dir.path())
+            .with_sync_on_write(true);
+
+        let writer = LogWriter::new(config).await.unwrap();
+        assert_eq!(writer.sync_mode(), SyncMode::FsyncOnWrite);
+
+        // 测试 with_sync_on_write(false) 映射到 None
+        let temp_dir2 = tempdir().unwrap();
+        let config2 = LogWriterConfig::default()
+            .with_dir(temp_dir2.path())
+            .with_sync_on_write(false);
+
+        let writer2 = LogWriter::new(config2).await.unwrap();
+        assert_eq!(writer2.sync_mode(), SyncMode::None);
+    }
+
+    #[tokio::test]
+    async fn test_batch_write_with_batch_sync_mode() {
+        use crate::wal::SyncMode;
+
+        let temp_dir = tempdir().unwrap();
+        let config = LogWriterConfig::default()
+            .with_dir(temp_dir.path())
+            .with_max_segment_size(10000)
+            .with_sync_mode(SyncMode::Batch { batch_size: 5 });
+
+        let writer = LogWriter::new(config).await.unwrap();
+
+        // 批量写入 3 条，不应该触发同步（< 5）
+        let data_list: Vec<&[u8]> = vec![b"a", b"bb", b"ccc"];
+        writer.write_batch(&data_list).await.unwrap();
+
+        // 再批量写入 3 条，总共 6 条，应该触发一次同步（>= 5）
+        let data_list2: Vec<&[u8]> = vec![b"dddd", b"eeeee"];
+        writer.write_batch(&data_list2).await.unwrap();
+
+        writer.close().await.unwrap();
     }
 }

@@ -11,6 +11,7 @@
   - RecoveryManager 场景测试
   - 协调器协作测试
   - 不同 SyncMode 的性能对比测试
+  - 配置热更新场景测试
 
 ## 已完成
 
@@ -34,3 +35,10 @@
   - `WalConfig` 和 `WalBuilder` 新增 `with_sync_mode()` API
   - 保持向后兼容：`with_sync_on_write(true/false)` 自动映射
   - `LogWriter` 新增 `sync_stats()` 和 `sync_mode()` 方法
+- [x] 配置热更新和监控增强 (2025-01-16)
+  - 配置与运行时状态分离设计
+  - 新增 `WalManager::sync_mode()` 查询当前同步模式
+  - 新增 `WalManager::set_sync_mode()` 支持运行时切换同步策略
+  - 新增 `WalManager::sync_stats()` 暴露同步统计信息
+  - 切换模式时自动重置内部状态，保留历史统计
+  - 线程安全设计，使用 RwLock 保护运行时状态

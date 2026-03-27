@@ -107,8 +107,7 @@ impl WalManager {
         // 创建写入器
         let writer_config = LogWriterConfig::default()
             .with_dir(&config.dir)
-            .with_max_segment_size(config.max_segment_size)
-            .with_sync_mode(config.sync_mode);
+            .with_max_segment_size(config.max_segment_size);
         let writer = Arc::new(LogWriter::new(writer_config).await?);
 
         // 创建读取器
@@ -120,7 +119,7 @@ impl WalManager {
         ));
 
         // 创建协调器
-        let write_coordinator = Arc::new(WriteCoordinator::new(writer));
+        let write_coordinator = Arc::new(WriteCoordinator::new(writer, config.sync_mode));
         let read_coordinator =
             Arc::new(ReadCoordinator::new(reader).with_read_ahead(config.read_ahead_size));
 
@@ -241,6 +240,41 @@ impl WalManager {
     pub async fn close(&self) -> Result<()> {
         self.write_coordinator.close().await?;
         self.read_coordinator.close().await
+    }
+
+    // ============================================================
+    // 监控和配置热更新
+    // ============================================================
+
+    /// 获取当前同步模式
+    ///
+    /// 用于监控和查询当前运行的同步策略
+    pub async fn sync_mode(&self) -> SyncMode {
+        self.write_coordinator.sync_mode().await
+    }
+
+    /// 设置同步模式（运行时修改）
+    ///
+    /// 允许在运行时切换同步策略，支持配置热更新。
+    /// 注意：
+    /// - 会重置批量计数器
+    /// - 会重置定时器
+    /// - 不会清除历史统计信息
+    ///
+    /// # 示例
+    /// ```ignore
+    /// // 从批量同步切换到每次写入同步
+    /// wal.set_sync_mode(SyncMode::FsyncOnWrite).await;
+    /// ```
+    pub async fn set_sync_mode(&self, mode: SyncMode) {
+        self.write_coordinator.set_sync_mode(mode).await
+    }
+
+    /// 获取同步统计信息
+    ///
+    /// 用于监控同步性能和行为
+    pub async fn sync_stats(&self) -> super::SyncStats {
+        self.write_coordinator.sync_stats().await
     }
 }
 

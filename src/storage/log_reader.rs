@@ -346,12 +346,12 @@ mod tests {
 
         let writer_config = LogWriterConfig::default()
             .with_dir(temp_dir.path())
-            .with_max_segment_size(10) // 小 size 便于触发轮转
-            .with_sync_on_write(true);
+            .with_max_segment_size(10); // 小 size 便于触发轮转
         let writer = LogWriter::new(writer_config).await.unwrap();
 
         // 写入数据触发轮转
         writer.write(b"12345678901").await.unwrap(); // 11 bytes
+        writer.sync().await.unwrap();
         writer.close().await.unwrap();
 
         let reader_config = LogReaderConfig::default().with_dir(temp_dir.path());
