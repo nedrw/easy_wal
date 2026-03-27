@@ -8,6 +8,34 @@
 use crate::prelude::*;
 use std::path::{Path, PathBuf};
 
+/// 段统计信息
+#[derive(Debug, Clone, Default)]
+pub struct SegmentStats {
+    /// 活跃段 ID
+    pub active_segment_id: u64,
+    /// 活跃段当前大小（字节）
+    pub active_segment_size: u64,
+    /// 活跃段最大大小（字节）
+    pub active_segment_max_size: u64,
+    /// 总段数量
+    pub segment_count: usize,
+    /// 总磁盘占用（字节）
+    pub total_size: u64,
+    /// 最大段 ID
+    pub max_segment_id: u64,
+}
+
+impl SegmentStats {
+    /// 活跃段使用率
+    pub fn active_usage_ratio(&self) -> f64 {
+        if self.active_segment_max_size == 0 {
+            0.0
+        } else {
+            self.active_segment_size as f64 / self.active_segment_max_size as f64
+        }
+    }
+}
+
 /// 段配置
 #[derive(Debug, Clone)]
 pub struct SegmentConfig {
@@ -290,6 +318,19 @@ impl SegmentManager {
     /// 获取配置
     pub fn config(&self) -> &SegmentConfig {
         &self.config
+    }
+
+    /// 获取段统计信息
+    pub fn stats(&self) -> SegmentStats {
+        let total_size: u64 = self.segments.iter().map(|s| s.size).sum();
+        SegmentStats {
+            active_segment_id: self.active_id,
+            active_segment_size: self.active_size,
+            active_segment_max_size: self.config.max_segment_size,
+            segment_count: self.segments.len(),
+            total_size,
+            max_segment_id: self.segments.iter().map(|s| s.id).max().unwrap_or(0),
+        }
     }
 
     /// 删除指定段

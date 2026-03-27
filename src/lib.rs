@@ -35,7 +35,7 @@ pub use prelude::{Error, Result};
 
 // 存储层导出
 pub use storage::{
-    Crc32, FileStorage, Location, LogWriter, LogWriterConfig, MemoryStorage, SegmentConfig,
+    Crc32, FileStorage, Location, LogWriter, LogWriterConfig, MemoryStorage, SegmentConfig, SegmentStats,
     SegmentManager, SegmentMeta, Storage, StorageStats, SyncMode, SyncStats, SyncStrategy,
     WritePosition, crc32, verify_crc32,
 };

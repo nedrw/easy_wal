@@ -21,7 +21,7 @@ pub use file_storage::FileStorage;
 pub use log_reader::{LogReader, LogReaderConfig, ReadPosition};
 pub use log_writer::{LogWriter, LogWriterConfig, WritePosition};
 pub use memory_storage::MemoryStorage;
-pub use segment_manager::{SegmentConfig, SegmentManager, SegmentMeta};
+pub use segment_manager::{SegmentConfig, SegmentManager, SegmentMeta, SegmentStats};
 pub use sync_strategy::{SyncMode, SyncStats, SyncStrategy};
 
 use crate::prelude::*;
