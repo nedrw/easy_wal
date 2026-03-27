@@ -35,13 +35,13 @@ pub use prelude::{Error, Result};
 
 // 存储层导出
 pub use storage::{
-    Crc32, FileStorage, Location, LogWriter, LogWriterConfig, MemoryStorage, SegmentConfig, SegmentStats,
-    SegmentManager, SegmentMeta, Storage, StorageStats, SyncMode, SyncStats, SyncStrategy,
-    WritePosition, crc32, verify_crc32,
+    Crc32, FileStorage, Location, LogWriter, LogWriterConfig, MemoryStorage, SegmentConfig,
+    SegmentManager, SegmentMeta, SegmentStats, Storage, StorageStats, WritePosition, crc32,
+    verify_crc32,
 };
 
 // WAL 层导出（协调层 + API 层）
 pub use wal::{
     Checkpoint, CheckpointPosition, ReadCoordinator, RecoveryManager, RecoveryMode, RecoveryResult,
-    WalBuilder, WalConfig, WalManager, WriteCoordinator,
+    SyncMode, SyncStats, SyncStrategy, WalBuilder, WalConfig, WalManager, WriteCoordinator,
 };

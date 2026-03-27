@@ -7,10 +7,12 @@
 
 mod coordinators;
 mod recovery;
+mod sync_strategy;
 mod wal_manager;
 
 pub use coordinators::{ReadCoordinator, WriteCoordinator};
 pub use recovery::{Checkpoint, CheckpointPosition, RecoveryManager, RecoveryMode, RecoveryResult};
+pub use sync_strategy::{SyncMode, SyncStats, SyncStrategy};
 pub use wal_manager::{Record, WalBuilder, WalConfig, WalManager};
 
 // 重新导出组件层类型，方便使用

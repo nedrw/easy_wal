@@ -1,130 +1,36 @@
-# WAL 项目进度跟踪
+# WAL 项目进度
 
-## 项目目标
-构建生产级 WAL（Write-Ahead Logging）系统，同时作为教学项目展示 Rust 核心概念。
-
-## 架构概览
+## 架构
 ```
 Layer 4: API 层        - WalManager, WalBuilder (src/wal/)
-Layer 3: 协调层        - WriteCoordinator, ReadCoordinator, RecoveryManager (src/wal/)
+Layer 3: 协调层        - WriteCoordinator, ReadCoordinator, RecoveryManager, SyncStrategy (src/wal/)
 Layer 2: 组件层        - LogWriter, LogReader, SegmentManager (src/storage/)
 Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage (src/storage/)
 ```
 
----
+## 阶段进度
 
-## 📊 阶段进度
+| Phase | 目标 | 状态 |
+|-------|------|------|
+| 1 | 存储层重构 | ✅ |
+| 2 | 文件管理（段轮转） | ✅ |
+| 3 | 读取功能 | ✅ |
+| 4 | 恢复机制 | ✅ |
+| 5 | 性能优化 | ✅ |
+| 6 | 可靠性增强 | ✅ |
+| 7 | 错误处理与状态查询 | ✅ |
+| 8 | 文档和示例 | ⬜ |
+| 9 | 压力测试 | ⬜ |
 
-### ✅ Phase 1: 存储层重构
-**目标**: 建立清晰的存储抽象，数据一致性保证
+**当前版本**: v0.7.1
 
-**任务**:
-- ✅ 创建 Storage trait（存储抽象）
-- ✅ 实现 FileStorage（文件存储）
-- ✅ 实现 MemoryStorage（内存存储，测试用）
-- ✅ 添加批量读写接口
-- ✅ 添加文件大小监控
-- ✅ 存储层单元测试
-- ✅ 并发读写测试
-- ✅ 存储层集成测试（独立测试文件）
+## 更新日志
 
-**产出**: v0.1.0 - 可靠的存储层 ✅
+### v0.7.1 (2025-01-14)
+- **架构调整**: `SyncStrategy` 从 `src/storage/` 移动到 `src/wal/`
+  - 同步策略属于协调层/API层设计，不属于底层存储层
+  - 保持四层架构职责清晰
 
----
+## 待办事项
 
-### ✅ Phase 2: 文件管理（段管理）
-**目标**: 实现多文件轮转
-
-**任务**:
-- ✅ 实现 SegmentManager
-- ✅ 集成到 LogWriter
-- ✅ 添加配置和测试
-- ✅ 集成测试验证
-
-**产出**: v0.2.0 - 支持文件轮转 ✅
-
----
-
-### ✅ Phase 3: 读取功能
-**目标**: 完整的顺序读取功能
-
-**任务**:
-- ✅ 实现 LogReader
-- ✅ 实现批量顺序读取
-- ✅ 实现 WalManager::read()
-- ✅ 读取集成测试
-
-**产出**: v0.3.0 - 可读可写
-
----
-
-### ✅ Phase 4: 恢复机制
-**目标**: 崩溃恢复
-
-**任务**:
-- ✅ 实现 RecoveryManager
-- ✅ 实现 Checkpoint 机制
-- ✅ 处理异常情况
-- ✅ 添加恢复测试
-
-**产出**: v0.4.0 - 支持崩溃恢复 ✅
-
----
-
-### ✅ Phase 5: 性能优化
-**目标**: 提升性能（10万+ QPS）
-
-**任务**:
-- ✅ 优化锁机制（AtomicXXX 替代 Mutex）
-- ✅ 添加缓冲机制（ReadAheadBuffer 预读优化）
-- ✅ Recovery 扫描策略优化（长度验证替代逐字节推进）
-
-**产出**: v0.5.0 - 高性能 ✅
-
----
-
-### ✅ Phase 6: 可靠性增强
-**目标**: 数据安全和一致性
-
-**任务**:
-- ✅ 实现同步策略（SyncStrategy, SyncMode, SyncStats）
-- ✅ 添加校验和验证（CRC32 模块）
-- ⬜ **性能基准测试**（移至后续阶段）
-
-**产出**: v0.6.0 - 高可靠
-
----
-
-### ✅ Phase 7: 错误处理与状态查询
-**目标**: 提升可调试性和可观测性
-
-**任务**:
-- ✅ 完善错误类型（区分不同错误场景）
-- ✅ 添加状态查询接口（SegmentManager::stats()）
-- ✅ 增强日志记录（tracing 集成）
-
-**产出**: v0.7.0 - 可调试
-
----
-
-### ⬜ Phase 8: 文档和示例
-**目标**: 完善文档
-
-**任务**:
-- ⬜ 编写架构文档
-- ⬜ 编写使用文档
-- ⬜ 编写教程和示例
-
-**产出**: v0.8.0 - 文档完善
-
----
-
-### ⬜ Phase 9: 压力和兼容性测试
-**目标**: 生产验证
-
-**任务**:
-- ⬜ 压力测试
-- ⬜ 兼容性测试
-- ⬜ 发布准备
-
-**产出**: v0.9.0 - 生产就绪
+参见 [TODO.md](./TODO.md)

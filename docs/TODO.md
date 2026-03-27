@@ -1,32 +1,36 @@
-# TODO - 优化事项记录
-
-本文档记录待完成事项和未来优化方向。
-
----
+# TODO
 
 ## 待完成
 
-- [ ] **性能基准测试**（10万+ QPS 目标）
-- [ ] Recovery 滑动窗口验证（8字节对齐前进）- 参见 WAL_FORMAT.md
-- [ ] Magic Number 标记（O(n) 扫描优化）- 参见 WAL_FORMAT.md
+- [ ] 性能基准测试（目标：10万+ QPS）
+  - 创建 `benches/bench.rs`
+  - 添加写入/读取/恢复/并发基准测试
+  - 启用 criterion 依赖（取消 Cargo.toml 注释）
 
----
+- [ ] Recovery 滑动窗口验证（8字节对齐）
+  - 实现 8 字节对齐前进
+  - 添加 Magic Number 标记优化扫描性能
+  - 修复 `src/wal/recovery.rs` 第 485 行逐字节前进问题
 
-## 已废弃项
+- [ ] SyncStrategy 集成到 LogWriter
+  - 将 `sync_on_write: bool` 改为 `sync_mode: SyncMode`
+  - 集成 SyncStrategy 统计功能
+  - 暴露同步指标
 
-| 项目 | 原因 |
-|------|------|
-| ~~事务支持~~ | WAL 不应实现事务，事务应由使用方在上层实现 |
-| ~~目录结构优化~~ | `storage/` 命名合理，无需改名 |
-| ~~RecoveryManager 存储依赖~~ | Checkpoint 是元数据，独立存储是正确的设计选择 |
-| ~~Checkpoint 存储格式~~ | 二进制是 WAL 标准做法，JSON/Protobuf 增加复杂度无收益 |
+- [ ] 预读缓冲区可配置化
+  - 在 WalConfig 添加 `read_ahead_size` 配置项
+  - 通过 ReadCoordinator 传递配置
+  - 修复 `src/wal/coordinators.rs` 第 108 行硬编码问题
 
----
+- [ ] 补充集成测试
+  - 添加 WalManager 完整生命周期测试
+  - 添加 RecoveryManager 场景测试（正常/部分损坏/完全损坏）
+  - 添加协调器协作测试
 
-## 后续计划
+## 已完成
 
-参见 [PROGRESS.md](./PROGRESS.md)
-
-- Phase 7: 监控和运维
-- Phase 8: 文档完善
-- Phase 9: 压力测试
+- ✅ 删除重复的 storage/wal_manager.rs
+- ✅ 四层架构重构（存储层/组件层/协调层/API层）
+- ✅ 段轮转机制实现
+- ✅ 读取功能实现
+- ✅ 恢复机制基础实现
