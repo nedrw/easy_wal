@@ -23,6 +23,14 @@ pub enum SyncMode {
         /// 同步间隔（毫秒）
         interval_ms: u64,
     },
+
+    /// 批量写入后同步
+    /// 在批量导入或突发流量时，每 N 次写入同步一次
+    /// 在性能和安全之间取得平衡
+    Batch {
+        /// 批量大小（写入次数）
+        batch_size: u64,
+    },
 }
 
 /// 同步统计
@@ -80,6 +88,8 @@ pub struct SyncStrategy {
     pending_bytes: u64,
     /// 最后同步时间（用于周期同步）
     last_sync_time: std::time::Instant,
+    /// 批量写入计数器
+    batch_counter: u64,
     /// 统计信息
     stats: RwLock<SyncStats>,
 }
@@ -92,8 +102,14 @@ impl SyncStrategy {
             mode,
             pending_bytes: 0,
             last_sync_time: now,
+            batch_counter: 0,
             stats: RwLock::new(SyncStats::new()),
         }
+    }
+
+    /// 创建批量同步策略
+    pub fn batch(batch_size: u64) -> Self {
+        Self::new(SyncMode::Batch { batch_size })
     }
 
     /// 创建周期同步策略
@@ -118,11 +134,21 @@ impl SyncStrategy {
     /// - `None` 表示不需要同步
     pub async fn on_write(&mut self, bytes: u64) -> Option<u64> {
         self.pending_bytes += bytes;
+        self.batch_counter += 1;
 
         match self.mode {
             SyncMode::None => None,
 
             SyncMode::FsyncOnWrite => Some(self.pending_bytes),
+
+            SyncMode::Batch { batch_size } => {
+                if self.batch_counter >= batch_size {
+                    self.batch_counter = 0;
+                    Some(self.pending_bytes)
+                } else {
+                    None
+                }
+            }
 
             SyncMode::Periodic { interval_ms } => {
                 let elapsed = self.last_sync_time.elapsed().as_millis() as u64;
@@ -147,6 +173,7 @@ impl SyncStrategy {
     /// 强制重置状态
     pub async fn reset(&mut self) {
         self.pending_bytes = 0;
+        self.batch_counter = 0;
         self.last_sync_time = std::time::Instant::now();
     }
 
@@ -167,6 +194,7 @@ impl std::fmt::Debug for SyncStrategy {
         f.debug_struct("SyncStrategy")
             .field("mode", &self.mode)
             .field("pending_bytes", &self.pending_bytes)
+            .field("batch_counter", &self.batch_counter)
             .finish()
     }
 }
@@ -193,6 +221,23 @@ mod tests {
 
         strategy.on_synced(100, 5).await;
         assert_eq!(strategy.pending_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_batch_sync() {
+        let mut strategy = SyncStrategy::batch(3);
+
+        // 前两次写入不触发同步
+        assert!(strategy.on_write(10).await.is_none());
+        assert!(strategy.on_write(20).await.is_none());
+
+        // 第三次触发
+        let should_sync = strategy.on_write(30).await;
+        assert!(should_sync.is_some());
+
+        strategy.on_synced(60, 5).await;
+        assert_eq!(strategy.batch_counter, 0);
+        assert_eq!(strategy.pending_bytes, 0);
     }
 
     #[tokio::test]
