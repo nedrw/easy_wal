@@ -147,17 +147,17 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage
 
 ---
 
-### 测试超时问题
+### 测试超时问题 ✅ 已修复
 **日期**: 2025-01-20
 
 **问题描述**:
-部分测试存在超时问题，可能原因：
-1. `FileStorage::write()` 方法中调用 `self.size().await?` 导致死锁
-2. `RwLock` 在持有写锁时尝试获取另一个锁
+部分测试存在超时问题
 
-**待修复的测试**:
-- `storage::file_storage::tests::test_write_and_read`
-- `tests/storage_integration.rs::test_file_storage_read_batch`
-- 其他并发相关测试
+**根因**:
+- `FileStorage::write()` 方法在持有 `stats` 锁时调用 `size()`
+- `size()` 尝试获取 `file` 读锁，导致嵌套锁等待超时
 
-**临时解决方案**: 测试套件拆分运行，后续修复锁机制
+**解决方案**:
+- 直接计算写入后的位置 (`offset + data.len()`)，避免嵌套锁调用
+
+**验证**: 所有 51 个测试通过 (33 unit + 18 integration)
