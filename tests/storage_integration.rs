@@ -266,11 +266,11 @@ async fn test_log_writer_rotation_on_limit() {
     let writer = LogWriter::new(config).await.unwrap();
 
     // 写入 "hello" (5 bytes) - 应该刚好达到上限
-    let pos1 = writer.write(b"hello").await.unwrap();
+    let _ = writer.write(b"hello").await.unwrap();
     let segment1 = writer.active_segment_id().await;
 
     // 写入 "world" (5 bytes) - 触发轮转
-    let pos2 = writer.write(b"world").await.unwrap();
+    let _ = writer.write(b"world").await.unwrap();
     let segment2 = writer.active_segment_id().await;
 
     // 应该已经轮转到新段
