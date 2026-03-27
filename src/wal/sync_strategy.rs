@@ -16,10 +16,6 @@ pub enum SyncMode {
     /// 典型延迟：5-15ms (HDD), 0.5-2ms (SSD)
     FsyncOnWrite,
 
-    /// 批量写入后同步
-    /// 在性能和安全之间取得平衡
-    SyncOnBatch,
-
     /// 定期同步
     /// 最多丢失 interval 时间的数据
     /// 性能最高但风险也最高
@@ -27,10 +23,6 @@ pub enum SyncMode {
         /// 同步间隔（毫秒）
         interval_ms: u64,
     },
-
-    /// 使用 fsync() 替代 fdatasync()
-    /// fdatasync 不同步元数据，性能更好但可能丢失文件大小信息
-    FdataSync,
 }
 
 /// 同步统计
@@ -84,10 +76,6 @@ impl SyncStats {
 /// 跟踪同步状态，决定何时执行同步操作。
 pub struct SyncStrategy {
     mode: SyncMode,
-    /// 批量写入计数器
-    batch_counter: u64,
-    /// 批量同步阈值
-    batch_threshold: u64,
     /// 待同步字节数
     pending_bytes: u64,
     /// 最后同步时间（用于周期同步）
@@ -102,8 +90,6 @@ impl SyncStrategy {
         let now = std::time::Instant::now();
         Self {
             mode,
-            batch_counter: 0,
-            batch_threshold: 100, // 默认 100 次写入后同步
             pending_bytes: 0,
             last_sync_time: now,
             stats: RwLock::new(SyncStats::new()),
@@ -113,12 +99,6 @@ impl SyncStrategy {
     /// 创建周期同步策略
     pub fn periodic(interval_ms: u64) -> Self {
         Self::new(SyncMode::Periodic { interval_ms })
-    }
-
-    /// 设置批量阈值
-    pub fn with_batch_threshold(mut self, threshold: u64) -> Self {
-        self.batch_threshold = threshold;
-        self
     }
 
     /// 获取同步模式
@@ -138,21 +118,11 @@ impl SyncStrategy {
     /// - `None` 表示不需要同步
     pub async fn on_write(&mut self, bytes: u64) -> Option<u64> {
         self.pending_bytes += bytes;
-        self.batch_counter += 1;
 
         match self.mode {
             SyncMode::None => None,
 
-            SyncMode::FsyncOnWrite | SyncMode::FdataSync => Some(self.pending_bytes),
-
-            SyncMode::SyncOnBatch => {
-                if self.batch_counter >= self.batch_threshold {
-                    self.batch_counter = 0;
-                    Some(self.pending_bytes)
-                } else {
-                    None
-                }
-            }
+            SyncMode::FsyncOnWrite => Some(self.pending_bytes),
 
             SyncMode::Periodic { interval_ms } => {
                 let elapsed = self.last_sync_time.elapsed().as_millis() as u64;
@@ -163,35 +133,6 @@ impl SyncStrategy {
                     None
                 }
             }
-        }
-    }
-
-    /// 通知批量写入完成
-    pub async fn on_batch(&mut self, bytes: u64) -> Option<u64> {
-        self.pending_bytes += bytes;
-
-        match self.mode {
-            SyncMode::SyncOnBatch => {
-                // 批量写入总是触发同步（除非是 None 模式）
-                if self.batch_counter > 0 {
-                    self.batch_counter = 0;
-                    Some(self.pending_bytes)
-                } else {
-                    None
-                }
-            }
-
-            SyncMode::Periodic { interval_ms } => {
-                let elapsed = self.last_sync_time.elapsed().as_millis() as u64;
-                if elapsed >= interval_ms {
-                    self.last_sync_time = std::time::Instant::now();
-                    Some(self.pending_bytes)
-                } else {
-                    None
-                }
-            }
-
-            _ => None,
         }
     }
 
@@ -206,7 +147,6 @@ impl SyncStrategy {
     /// 强制重置状态
     pub async fn reset(&mut self) {
         self.pending_bytes = 0;
-        self.batch_counter = 0;
         self.last_sync_time = std::time::Instant::now();
     }
 
@@ -226,8 +166,6 @@ impl std::fmt::Debug for SyncStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SyncStrategy")
             .field("mode", &self.mode)
-            .field("batch_counter", &self.batch_counter)
-            .field("batch_threshold", &self.batch_threshold)
             .field("pending_bytes", &self.pending_bytes)
             .finish()
     }
@@ -255,21 +193,6 @@ mod tests {
 
         strategy.on_synced(100, 5).await;
         assert_eq!(strategy.pending_bytes(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_batch_threshold() {
-        let mut strategy = SyncStrategy::new(SyncMode::SyncOnBatch).with_batch_threshold(3);
-
-        // 前两次写入不触发同步
-        assert!(strategy.on_write(10).await.is_none());
-        assert!(strategy.on_write(20).await.is_none());
-
-        // 第三次触发
-        let should_sync = strategy.on_write(30).await;
-        assert!(should_sync.is_some());
-
-        strategy.on_synced(60, 5).await;
     }
 
     #[tokio::test]

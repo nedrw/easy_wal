@@ -24,15 +24,6 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage (src/stora
 
 **当前版本**: v0.7.2
 
-## 更新日志
-
-### v0.7.2 (2025-01-15)
-- Recovery O(n²) → O(n) 优化（损坏扫描 8 字节对齐前进）
-- 预读缓冲区可配置化（`WalConfig.read_ahead_size`）
-
-### v0.7.1 (2025-01-14)
-- `SyncStrategy` 从 `src/storage/` 移动到 `src/wal/`
-
 ## 待办事项
 
 参见 [TODO.md](./TODO.md)
