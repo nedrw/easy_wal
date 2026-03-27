@@ -6,15 +6,19 @@
 
 ## Phase 5: 性能优化
 
-### 1. Coordinators 逻辑增强
-**问题**: 当前 `WriteCoordinator` 和 `ReadCoordinator` 较薄，未实现批量优化、请求队列等功能
-**建议**: 
-- WriteCoordinator: 实现批量写入缓冲、写入队列
-- ReadCoordinator: 实现预读缓冲、并发读取控制
+### ✅ 已完成
+- ✅ WriteCoordinator 简化（减少锁竞争）
+- ✅ ReadCoordinator 预读缓冲（64KB）
+- ✅ Recovery O(n²) 问题文档化
 
-### 2. Recovery 扫描策略优化
+### 🔲 后续计划
+- [ ] **性能基准测试**（10万+ QPS 目标）- 适合在 Phase 5 整体调优时完成
+- [ ] Recovery 滑动窗口验证（8字节对齐前进）- 参见 PHASE5_IMPLEMENTATION.md
+- [ ] WriteCoordinator 批量写入缓冲
+
+### ⚠️ 待解决
 **问题**: FullScan 模式逐字节前进（O(n²)），大文件效率低
-**建议**: 实现 magic number 或块对齐优化
+**建议**: 实现 magic number 或块对齐优化（参见 WAL_FORMAT.md）
 
 ---
 
