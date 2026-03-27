@@ -164,6 +164,34 @@ impl LogReader {
         Ok(results)
     }
 
+    /// 读取原始数据（不解析格式）
+    ///
+    /// 用于预读优化，直接从存储读取原始字节。
+    pub async fn read_raw(&self, length: usize) -> Result<Vec<u8>> {
+        let pos = self.position.read().await;
+        let storage = match self.get_storage_for_segment(pos.segment_id).await {
+            Ok(s) => s,
+            Err(Error::Generic(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let data = storage.read(pos.offset, length as u64).await?;
+
+        // 更新位置
+        drop(pos);
+        let mut write_pos = self.position.write().await;
+        write_pos.offset += data.len() as u64;
+
+        Ok(data)
+    }
+
+    /// 获取指定段的路径
+    pub fn segment_path(&self, segment_id: u64) -> Option<std::path::PathBuf> {
+        // 同步获取 manager
+        let manager = self.segment_manager.blocking_read();
+        manager.segment_path(segment_id)
+    }
+
     /// 读取下一条数据
     ///
     /// 从当前位置读取一条数据，并更新位置。

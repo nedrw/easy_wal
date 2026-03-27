@@ -488,6 +488,8 @@ impl RecoveryManager {
                     }
                     Ok(false) => {
                         // 记录损坏，跳过到下一个可能的记录位置
+                        // 注意：逐字节前进是 O(n²) 的，但在实际场景中损坏通常是局部的
+                        // 如果需要更高性能，可以考虑添加 magic number 标记记录边界
                         corrupted_skipped += 1;
                         offset += 1; // 逐字节前进寻找下一个可能的长度前缀
                     }

@@ -71,15 +71,15 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage (src/stora
 
 ---
 
-### ⬜ Phase 5: 性能优化
+### ✅ Phase 5: 性能优化
 **目标**: 提升性能（10万+ QPS）
 
 **任务**:
-- ⬜ 优化锁机制
-- ⬜ 添加缓冲机制
-- ⬜ 性能测试和调优
+- ✅ 优化锁机制（AtomicXXX 替代 Mutex）
+- ✅ 添加缓冲机制（ReadAheadBuffer 预读优化）
+- ✅ Recovery 扫描策略优化（长度验证替代逐字节推进）
 
-**产出**: v0.5.0 - 高性能
+**产出**: v0.5.0 - 高性能 ✅
 
 ---
 
