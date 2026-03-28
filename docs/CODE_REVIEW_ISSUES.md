@@ -1,6 +1,6 @@
 
 **Review 日期**: 2025-01-09  
-**最后更新**: 2025-04-15
+**最后更新**: 2025-04-28
 
 ---
 
@@ -50,16 +50,46 @@
 
 ---
 
-### P2 - 测试覆盖不足
+### P2 - 测试覆盖不足 ✅ 已完成
 
-**现有测试**: Storage trait、FileStorage 并发、SegmentManager 轮转、LogWriter 写入、MemoryStorage、SyncStrategy 单元测试
+**位置**: `tests/wal_integration.rs`
 
-**缺少的高级测试**:
-- WalManager 完整生命周期测试（创建→写入→崩溃→恢复）
-- RecoveryManager 场景测试（正常/部分损坏/完全损坏）
-- 协调器协作测试
-- 检查点创建/加载/删除流程测试
-- 不同 SyncMode 的性能对比测试
+**修复内容**:
+- 新增 26 个高级集成测试，覆盖：
+  - WalManager 完整生命周期测试（创建→写入→崩溃→恢复）
+  - RecoveryManager 场景测试（正常/部分损坏/完全损坏）
+  - 协调器协作测试
+  - 检查点创建/加载/删除流程测试
+  - 不同 SyncMode 的性能对比测试
+  - 边界情况和错误处理
+
+**测试用例**:
+- `test_wal_manager_full_lifecycle` - 完整生命周期
+- `test_wal_manager_crash_recovery` - 崩溃恢复
+- `test_wal_manager_segment_rotation_with_recovery` - 段轮转恢复
+- `test_recovery_normal_case` - 正常恢复
+- `test_recovery_with_checkpoint` - 检查点恢复
+- `test_recovery_mode_full_scan` - 全量扫描模式
+- `test_recovery_mode_incremental` - 增量模式
+- `test_recovery_mode_verify_only` - 仅验证模式
+- `test_checkpoint_create_and_load` - 检查点创建加载
+- `test_checkpoint_delete` - 检查点删除
+- `test_checkpoint_sequential_writes` - 顺序写入检查点
+- `test_write_read_coordinator_collaboration` - 读写协作
+- `test_batch_write_read_coordinator` - 批量读写协作
+- `test_seek_and_continue_writing` - 寻址后继续写入
+- `test_sync_mode_none_performance` - None模式性能
+- `test_sync_mode_fsync_on_write` - FsyncOnWrite模式
+- `test_sync_mode_batch` - 批量同步模式
+- `test_sync_mode_periodic` - 周期同步模式
+- `test_sync_mode_runtime_switch` - 运行时切换模式
+- `test_empty_wal_recovery` - 空WAL恢复
+- `test_single_record_crash_recovery` - 单记录崩溃恢复
+- `test_large_record_batch` - 大记录批量
+- `test_concurrent_write_and_read` - 并发读写
+- `test_reopen_and_read_existing_data` - 重开读取
+- `test_position_tracking` - 位置追踪
+- `test_multi_segment_scan_after_recovery` - 多段扫描
 
 ---
 
@@ -137,7 +167,7 @@ let data = storage.read(data_offset, length).await?;    // IO 4
 |--------|------|------------|
 | P1 | 性能基准测试 | 中 |
 | P2 | write_batch 非原子性 | 低 |
-| P2 | 测试覆盖不足 | 中 |
+| P2 | 测试覆盖不足 | ✅ 已完成 |
 | P3 | 段轮转竞态条件 | 中 |
 | P3 | LogReader::read_next IO 效率 | 低 |
 | P3 | 缺少 sync 回调 | 低 |
