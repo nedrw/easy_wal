@@ -12,7 +12,6 @@ use crate::prelude::*;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-
 /// 内存存储实现
 ///
 /// 使用 `Vec<u8>` 存储所有数据，适合测试和开发环境。
@@ -140,6 +139,44 @@ impl Storage for MemoryStorage {
         Ok(offset)
     }
 
+    /// 批量追加数据到末尾
+    ///
+    /// # 实现
+    /// 一次性获取当前末尾位置，然后批量追加所有数据
+    /// 保证原子性：要么全部成功，要么全部失败
+    async fn append_batch(&self, data_list: &[&[u8]]) -> Result<Vec<u64>> {
+        if data_list.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut storage = self.data.write().await;
+        let start_offset = storage.len() as u64;
+
+        // 预先计算每条数据的起始位置
+        let mut offsets = Vec::with_capacity(data_list.len());
+        let mut current_offset = start_offset;
+        for data in data_list {
+            offsets.push(current_offset);
+            current_offset += data.len() as u64;
+        }
+
+        // 批量追加所有数据
+        for data in data_list {
+            storage.extend_from_slice(data);
+        }
+
+        // 更新统计信息
+        drop(storage);
+        {
+            let mut stats = self.stats.write().await;
+            stats.bytes_written += data_list.iter().map(|d| d.len() as u64).sum::<u64>();
+            stats.write_ops += 1;
+            stats.size = self.data.read().await.len() as u64;
+        }
+
+        Ok(offsets)
+    }
+
     /// 批量读取多个数据块
     ///
     /// # 实现
@@ -162,7 +199,7 @@ impl Storage for MemoryStorage {
     async fn write_batch(&self, offsets: &[u64], data_list: &[&[u8]]) -> Result<()> {
         if offsets.len() != data_list.len() {
             return Err(Error::Generic(
-                "offsets and data_list must have the same length".to_string()
+                "offsets and data_list must have the same length".to_string(),
             ));
         }
 
@@ -380,9 +417,7 @@ mod tests {
         let mut handles = vec![];
         for offset in offsets {
             let s = storage.clone();
-            let handle = task::spawn(async move {
-                s.read(offset, 5).await.unwrap()
-            });
+            let handle = task::spawn(async move { s.read(offset, 5).await.unwrap() });
             handles.push(handle);
         }
 

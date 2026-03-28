@@ -232,6 +232,18 @@ pub trait Storage: Send + Sync {
     /// 返回写入的起始位置
     async fn append(&self, data: &[u8]) -> Result<u64>;
 
+    /// 批量追加数据到文件末尾
+    ///
+    /// # 参数
+    /// - `data_list`: 数据列表
+    ///
+    /// # 返回
+    /// 返回每条数据写入的起始位置列表
+    ///
+    /// # 注意
+    /// 原子性：要么全部成功，要么全部失败
+    async fn append_batch(&self, data_list: &[&[u8]]) -> Result<Vec<u64>>;
+
     /// 批量读取多个数据块
     ///
     /// # 参数

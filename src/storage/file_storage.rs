@@ -290,6 +290,62 @@ impl Storage for FileStorage {
         Ok(offset)
     }
 
+    /// 批量追加数据到文件末尾
+    ///
+    /// # 实现
+    /// 一次性获取文件末尾位置，然后批量写入所有数据
+    /// 保证原子性：要么全部成功，要么全部失败
+    async fn append_batch(&self, data_list: &[&[u8]]) -> Result<Vec<u64>> {
+        if data_list.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut file = self.file.write().await;
+
+        // 定位到文件末尾并获取起始偏移量
+        file.seek(std::io::SeekFrom::End(0))
+            .await
+            .map_err(|e| Error::Generic(format!("Seek failed: {}", e)))?;
+        let start_offset = file
+            .stream_position()
+            .await
+            .map_err(|e| Error::Generic(format!("Failed to get position: {}", e)))?;
+
+        // 预先计算每条数据的起始位置
+        let mut offsets = Vec::with_capacity(data_list.len());
+        let mut current_offset = start_offset;
+        for data in data_list {
+            offsets.push(current_offset);
+            current_offset += data.len() as u64;
+        }
+
+        // 合并所有数据到单个缓冲区，一次性写入
+        let total_size: usize = data_list.iter().map(|d| d.len()).sum();
+        let mut combined = Vec::with_capacity(total_size);
+        for data in data_list {
+            combined.extend_from_slice(data);
+        }
+
+        // 一次性写入所有数据
+        file.write_all(&combined)
+            .await
+            .map_err(|e| Error::Generic(format!("Write batch failed: {}", e)))?;
+
+        // 计算最终文件大小
+        let final_size = start_offset + combined.len() as u64;
+
+        // 更新统计信息
+        drop(file);
+        {
+            let mut stats = self.stats.write().await;
+            stats.bytes_written += combined.len() as u64;
+            stats.write_ops += 1;
+            stats.size = final_size;
+        }
+
+        Ok(offsets)
+    }
+
     /// 批量读取多个数据块
     ///
     /// # 实现

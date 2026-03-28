@@ -176,65 +176,106 @@ impl LogWriter {
 
     /// 批量写入
     ///
-    /// 使用 storage 层的批量写入接口，一次性写入多条记录。
+    /// 使用 storage 层的原子批量追加接口，支持跨段写入。
+    /// 单条记录不可拆分跨段，多条记录可在段内批量追加（段内原子）。
+    /// 当批量数据超过段大小时，自动轮转到新段继续写入。
     /// 根据同步策略决定是否执行 fsync。
     pub async fn write_batch(&self, data_list: &[&[u8]]) -> Result<Vec<WritePosition>> {
         if data_list.is_empty() {
             return Ok(Vec::new());
         }
 
-        let storage = self.get_active_storage().await?;
+        // 准备所有数据（记录头 + 数据）
+        let records: Vec<Vec<u8>> = data_list
+            .iter()
+            .map(|data| {
+                let data_crc = crc32(data);
+                let mut record =
+                    Vec::with_capacity(format::RECORD_HEADER_SIZE as usize + data.len());
 
-        let segment_id = {
-            let manager = self.segment_manager.read().await;
-            manager.active_id()
-        };
+                // 记录头: [4B magic][4B length][4B crc]
+                record.extend_from_slice(&format::RECORD_MAGIC.to_be_bytes());
+                record.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                record.extend_from_slice(&data_crc.to_be_bytes());
+                // 数据
+                record.extend_from_slice(data);
 
-        // 准备所有数据
-        let mut all_data = Vec::new();
+                record
+            })
+            .collect();
+
         let mut positions = Vec::with_capacity(data_list.len());
+        let mut record_index = 0;
 
-        for data in data_list {
-            let data_crc = crc32(data);
-            let mut record = Vec::with_capacity(format::RECORD_HEADER_SIZE as usize + data.len());
+        while record_index < records.len() {
+            // 获取当前活跃存储
+            let storage = self.get_active_storage().await?;
 
-            // 记录头
-            record.extend_from_slice(&format::RECORD_MAGIC.to_be_bytes());
-            record.extend_from_slice(&(data.len() as u32).to_be_bytes());
-            record.extend_from_slice(&data_crc.to_be_bytes());
-            // 数据
-            record.extend_from_slice(data);
-
-            all_data.push(record);
-        }
-
-        // 一次性写入所有数据
-        // 注意：这里我们使用循环 append，因为每条记录需要独立的位置信息
-        // 如果 storage 层支持原子批量 append 并返回位置，可以优化
-        let mut current_offset = storage.size().await?;
-
-        for (i, data) in data_list.iter().enumerate() {
-            let record = &all_data[i];
-            storage.append(record).await?;
-
-            let data_offset = current_offset + format::RECORD_HEADER_SIZE;
-            let total_len = record.len() as u64;
-
-            positions.push(WritePosition {
-                segment_id,
-                offset: data_offset,
-                length: data.len() as u64,
-            });
-
-            current_offset += total_len;
-
-            // 更新段大小
-            let should_rotate = {
-                let mut manager = self.segment_manager.write().await;
-                manager.update_active_size(total_len)
+            // 获取段配置
+            let (segment_id, max_segment_size) = {
+                let manager = self.segment_manager.read().await;
+                (manager.active_id(), manager.config().max_segment_size)
             };
 
-            if should_rotate {
+            // 计算当前段剩余空间
+            let current_size = storage.size().await?;
+            let header_size = format::SEGMENT_HEADER_SIZE;
+            let remaining = if current_size < header_size {
+                max_segment_size.saturating_sub(header_size)
+            } else {
+                max_segment_size.saturating_sub(current_size - header_size)
+            };
+
+            // 找出当前段能容纳的记录（贪心填充）
+            let mut batch_records: Vec<&[u8]> = Vec::new();
+            let mut batch_size: u64 = 0;
+            let mut batch_indices: Vec<usize> = Vec::new();
+
+            while record_index < records.len() {
+                let record_len = records[record_index].len() as u64;
+                // 单条记录不能超过段最大大小（否则永远无法写入）
+                if record_len > max_segment_size - header_size {
+                    return Err(Error::Generic(format!(
+                        "Record size {} exceeds maximum segment capacity",
+                        record_len
+                    )));
+                }
+                // 检查是否能容纳下一条记录
+                if batch_size + record_len > remaining && !batch_records.is_empty() {
+                    break; // 当前段满了，停止填充
+                }
+                batch_records.push(records[record_index].as_slice());
+                batch_indices.push(record_index);
+                batch_size += record_len;
+                record_index += 1;
+            }
+
+            // 批量追加到当前段（段内原子）
+            let offsets = storage.append_batch(&batch_records).await?;
+
+            // 更新段大小
+            {
+                let mut manager = self.segment_manager.write().await;
+                manager.update_active_size(batch_size);
+            }
+
+            // 构建当前位置信息
+            for (i, &offset) in offsets.iter().enumerate() {
+                let data_idx = batch_indices[i];
+                positions.push(WritePosition {
+                    segment_id,
+                    offset: offset + format::RECORD_HEADER_SIZE,
+                    length: data_list[data_idx].len() as u64,
+                });
+            }
+
+            // 检查是否需要轮转到新段
+            let needs_rotate = {
+                let manager = self.segment_manager.read().await;
+                manager.should_rotate()
+            };
+
+            if needs_rotate {
                 // 轮转到新段
                 let mut manager = self.segment_manager.write().await;
                 manager
@@ -244,12 +285,6 @@ impl LogWriter {
                 // 清除活跃存储
                 let mut active = self.active_storage.write().await;
                 *active = None;
-
-                // 获取新段的存储
-                drop(active);
-                drop(manager);
-                let new_storage = self.get_active_storage().await?;
-                current_offset = new_storage.size().await?;
             }
         }
 
@@ -407,5 +442,40 @@ mod tests {
         assert_eq!(positions[0].length, 1);
         assert_eq!(positions[1].length, 2);
         assert_eq!(positions[2].length, 3);
+    }
+
+    #[tokio::test]
+    async fn test_batch_write_cross_segment() {
+        let temp_dir = tempdir().unwrap();
+        // 设置小段大小以便触发跨段
+        let config = LogWriterConfig::default()
+            .with_dir(temp_dir.path())
+            .with_max_segment_size(50); // 每个段最多50字节
+
+        let writer = LogWriter::new(config).await.unwrap();
+
+        // 准备数据：每条记录约20字节，3条约60字节，需要跨段
+        let data_list: Vec<&[u8]> = vec![
+            b"12345678901234", // 14 bytes data + 12 bytes header = 26 bytes
+            b"12345678901234", // 26 bytes
+            b"12345678901234", // 26 bytes (总计78字节，超过50字节段限制)
+        ];
+
+        let positions = writer.write_batch(&data_list).await.unwrap();
+
+        assert_eq!(positions.len(), 3);
+
+        // 验证产生了多个段
+        let segments = writer.segments().await;
+        assert!(
+            segments.len() >= 2,
+            "Expected at least 2 segments, got {}",
+            segments.len()
+        );
+
+        // 验证位置信息：前两条在同一段，第三条在新区段
+        assert_eq!(positions[0].segment_id, 1);
+        assert_eq!(positions[1].segment_id, 1);
+        assert_eq!(positions[2].segment_id, 2);
     }
 }

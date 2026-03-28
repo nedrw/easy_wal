@@ -31,21 +31,22 @@
 
 ---
 
-### P2 - write_batch 非原子性
+### P2 - write_batch 非原子性 ✅ 已完成
 
-**位置**: `src/storage/log_writer.rs#L127-148`
+**位置**: `src/storage/log_writer.rs`
 
-**问题**: 批量写入在循环中逐条 append，如果中间失败会导致数据部分写入。
+**修复内容**:
+- `src/storage/mod.rs`: 在 `Storage` trait 中添加 `append_batch` 方法声明，保证原子性
+- `src/storage/file_storage.rs`: 实现 `FileStorage::append_batch`，合并所有数据到单个缓冲区后一次性写入
+- `src/storage/memory_storage.rs`: 实现 `MemoryStorage::append_batch`
+- `src/storage/log_writer.rs`: 重写 `write_batch` 方法，支持跨段批量写入
 
-```rust
-for (i, data) in data_list.iter().enumerate() {
-    // ...
-    storage.append(record).await?;  // 可能中途失败
-    // ...
-}
-```
+**修复说明**: 
+1. `append_batch` 方法在写入前一次性获取文件末尾偏移量，将所有记录合并为单个缓冲区后通过一次 `write_all` 调用完成写入，保证段内原子性
+2. `write_batch` 实现跨段支持：当批量数据超过单段容量时，自动轮转到新段继续写入
+3. 单条记录不可拆分跨段，多条记录可在段内批量追加（段内原子）
+4. 添加 `test_batch_write_cross_segment` 测试用例验证跨段批量写入
 
-**建议修复**: 改用 `storage.write_batch()` 批量写入，保证原子性。
 
 ---
 
