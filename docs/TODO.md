@@ -29,12 +29,16 @@
   - verify_record 验证 Magic + Length + CRC32
   - find_next_magic 用于损坏时快速跳到下一条记录
   - LogWriter/LogReader/RecoveryManager 全部对齐新格式
-- [x] SyncStrategy 集成到 LogWriter
-  - `LogWriterConfig` 使用 `sync_mode: SyncMode` 替代 `sync_on_write: bool`
-  - 支持四种同步模式：None、FsyncOnWrite、Periodic(interval_ms)、Batch(batch_size)
-  - `WalConfig` 和 `WalBuilder` 新增 `with_sync_mode()` API
-  - 保持向后兼容：`with_sync_on_write(true/false)` 自动映射
-  - `LogWriter` 新增 `sync_stats()` 和 `sync_mode()` 方法
+- [x] 预读优化修复 (2026-03-28)
+  - 修复 `ReadCoordinator::with_read_ahead()` 空实现问题
+  - 修复 `seek_to_start()` 死锁问题（锁嵌套调用）
+  - 修复 `ReadAheadBuffer::read()` Magic 验证逻辑
+  - `ReadAheadBuffer` 移除冗余的 `size` 字段
+- [x] SyncContext 状态去重 (2026-03-28)
+  - `LogWriter` 移除 `sync_mode` 字段，只负责纯写入操作
+  - `LogWriterConfig` 移除 `with_sync_mode()` 和 `with_sync_on_write()` API
+  - `WriteCoordinator` 是唯一持有 `SyncContext` 的组件
+  - 明确分层：L3 协调层负责决策，L2 存储层负责执行
 - [x] 配置热更新和监控增强 (2025-01-16)
   - 配置与运行时状态分离设计
   - 新增 `WalManager::sync_mode()` 查询当前同步模式

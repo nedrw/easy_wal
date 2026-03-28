@@ -219,6 +219,8 @@ pub struct ReadCoordinator {
     reader: Arc<RwLock<LogReader>>,
     /// 预读缓冲区
     read_ahead_buffer: Arc<RwLock<ReadAheadBuffer>>,
+    /// 预读大小
+    read_ahead_size: usize,
 }
 
 /// 预读缓冲区
@@ -232,9 +234,9 @@ struct ReadAheadBuffer {
 }
 
 impl ReadAheadBuffer {
-    fn new() -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
-            data: Vec::new(),
+            data: Vec::with_capacity(capacity),
             pos: 0,
             exhausted: false,
         }
@@ -246,6 +248,57 @@ impl ReadAheadBuffer {
         self.pos = 0;
         self.exhausted = false;
     }
+
+    /// 检查缓冲区是否有数据
+    fn has_data(&self) -> bool {
+        self.pos < self.data.len()
+    }
+
+    /// 从缓冲区读取数据
+    fn read(&mut self) -> Option<Vec<u8>> {
+        if !self.has_data() {
+            return None;
+        }
+
+        // 读取 Magic (4 bytes)
+        if self.pos + 4 > self.data.len() {
+            return None;
+        }
+        let magic_bytes: [u8; 4] = self.data[self.pos..self.pos + 4].try_into().unwrap();
+        let magic = u32::from_be_bytes(magic_bytes);
+
+        // 验证 Magic
+        if magic != crate::storage::format::RECORD_MAGIC {
+            return None;
+        }
+
+        // 读取长度 (4 bytes)
+        if self.pos + 8 > self.data.len() {
+            return None;
+        }
+        let length_bytes: [u8; 4] = self.data[self.pos + 4..self.pos + 8].try_into().unwrap();
+        let length = u32::from_be_bytes(length_bytes) as usize;
+
+        // 验证数据完整性
+        let record_size = 4 + 4 + 4 + length; // magic + length + crc + data
+        if self.pos + record_size > self.data.len() {
+            return None;
+        }
+
+        // 提取数据（跳过 magic 4B + length 4B + crc 4B）
+        let data_start = self.pos + 12;
+        let data = self.data[data_start..data_start + length].to_vec();
+
+        self.pos += record_size;
+        Some(data)
+    }
+
+    /// 填充缓冲区
+    fn fill(&mut self, data: Vec<u8>) {
+        self.data = data;
+        self.pos = 0;
+        self.exhausted = false;
+    }
 }
 
 impl ReadCoordinator {
@@ -253,13 +306,47 @@ impl ReadCoordinator {
     pub fn new(reader: Arc<RwLock<LogReader>>) -> Self {
         Self {
             reader,
-            read_ahead_buffer: Arc::new(RwLock::new(ReadAheadBuffer::new())),
+            read_ahead_buffer: Arc::new(RwLock::new(ReadAheadBuffer::new(64 * 1024))),
+            read_ahead_size: 64 * 1024,
         }
     }
 
-    /// 设置预读大小（保留接口兼容性）
-    pub fn with_read_ahead(self, _size: usize) -> Self {
+    /// 设置预读大小
+    pub fn with_read_ahead(mut self, size: usize) -> Self {
+        self.read_ahead_size = size;
+        self.read_ahead_buffer = Arc::new(RwLock::new(ReadAheadBuffer::new(size)));
         self
+    }
+
+    /// 尝试从预读缓冲区读取
+    async fn read_from_buffer(&self) -> Option<Vec<u8>> {
+        let mut buffer = self.read_ahead_buffer.write().await;
+        buffer.read()
+    }
+
+    /// 填充预读缓冲区
+    async fn fill_buffer(&self) -> Result<()> {
+        let mut buffer = self.read_ahead_buffer.write().await;
+
+        // 只有当缓冲区完全为空时才填充
+        // 如果缓冲区有残留数据但无法解析，说明是损坏或不完整记录，直接清空
+        if buffer.has_data() {
+            return Ok(());
+        }
+
+        // 从 LogReader 读取原始数据填充缓冲区
+        let raw_data = {
+            let reader = self.reader.read().await;
+            reader.read_raw(self.read_ahead_size).await?
+        };
+
+        if raw_data.is_empty() {
+            buffer.exhausted = true;
+            return Err(Error::Eof);
+        }
+
+        buffer.fill(raw_data);
+        Ok(())
     }
 
     /// 获取底层读取器
@@ -267,18 +354,44 @@ impl ReadCoordinator {
         self.reader.clone()
     }
 
+    /// 获取预读大小
+    pub fn read_ahead_size(&self) -> usize {
+        self.read_ahead_size
+    }
+
     /// 读取下一条记录
     ///
-    /// 直接使用 LogReader.read_next()，它会正确解析记录格式
-    /// 格式: [4字节 magic][4字节长度][4字节CRC32][数据...]
+    /// 优先从预读缓冲区读取，缓冲区耗尽时自动填充
+    /// 格式：[4 字节 magic][4 字节长度][4 字节 CRC32][数据...]
     pub async fn read_next(&self) -> Result<Vec<u8>> {
-        let reader = self.reader.read().await;
-        reader.read_next().await
+        // 尝试从预读缓冲区读取
+        if let Some(data) = self.read_from_buffer().await {
+            return Ok(data);
+        }
+
+        // 缓冲区为空，填充缓冲区
+        match self.fill_buffer().await {
+            Ok(()) => {
+                // 再次尝试从缓冲区读取
+                if let Some(data) = self.read_from_buffer().await {
+                    return Ok(data);
+                }
+                // 缓冲区填充后仍无数据或无法解析，说明到达末尾
+                Err(Error::Eof)
+            }
+            Err(Error::Eof) => Err(Error::Eof),
+            Err(e) => Err(e),
+        }
     }
 
     /// 批量顺序读取
+    ///
+    /// 利用预读缓冲区优化批量读取性能
     pub async fn read_batch(&self, max_count: usize) -> Result<Vec<Vec<u8>>> {
         let mut records = Vec::with_capacity(max_count);
+
+        // 预先填充缓冲区
+        let _ = self.fill_buffer().await;
 
         for _ in 0..max_count {
             match self.read_next().await {
@@ -302,11 +415,18 @@ impl ReadCoordinator {
 
     /// 跳转到开头
     pub async fn seek_to_start(&self) {
-        let mut buffer = self.read_ahead_buffer.write().await;
-        buffer.clear();
+        {
+            let mut buffer = self.read_ahead_buffer.write().await;
+            buffer.clear();
+        }
 
-        let reader = self.reader.read().await;
-        reader.seek_to_start().await;
+        {
+            let reader = self.reader.read().await;
+            reader.seek_to_start().await;
+        }
+
+        // 预填充缓冲区
+        let _ = self.fill_buffer().await;
     }
 
     /// 获取当前位置

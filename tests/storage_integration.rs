@@ -232,8 +232,7 @@ async fn test_log_writer_full_workflow() {
 
     let config = LogWriterConfig::default()
         .with_dir(temp_dir.path())
-        .with_max_segment_size(100)
-        .with_sync_on_write(true);
+        .with_max_segment_size(100);
 
     let writer = LogWriter::new(config).await.unwrap();
 
@@ -416,9 +415,7 @@ async fn test_concurrent_segment_creation() {
 async fn test_write_persistence() {
     let temp_dir = tempdir().unwrap();
 
-    let config = LogWriterConfig::default()
-        .with_dir(temp_dir.path())
-        .with_sync_on_write(true);
+    let config = LogWriterConfig::default().with_dir(temp_dir.path());
 
     let writer = LogWriter::new(config).await.unwrap();
     writer.write(b"important data").await.unwrap();

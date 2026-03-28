@@ -7,7 +7,6 @@
 
 use super::{FileStorage, SegmentConfig, SegmentManager, Storage, crc32, format};
 use crate::prelude::*;
-use crate::wal::{SyncContext, SyncMode};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -19,8 +18,6 @@ pub struct LogWriterConfig {
     pub segment_config: SegmentConfig,
     /// 缓冲区大小
     pub buffer_size: usize,
-    /// 同步模式
-    pub sync_mode: SyncMode,
 }
 
 impl Default for LogWriterConfig {
@@ -28,7 +25,6 @@ impl Default for LogWriterConfig {
         Self {
             segment_config: SegmentConfig::default(),
             buffer_size: 64 * 1024, // 64KB
-            sync_mode: SyncMode::None,
         }
     }
 }
@@ -41,22 +37,6 @@ impl LogWriterConfig {
 
     pub fn with_max_segment_size(mut self, size: u64) -> Self {
         self.segment_config = self.segment_config.with_max_size(size);
-        self
-    }
-
-    /// 设置同步模式
-    pub fn with_sync_mode(mut self, mode: SyncMode) -> Self {
-        self.sync_mode = mode;
-        self
-    }
-
-    /// 兼容旧 API：设置是否每次写入后同步
-    pub fn with_sync_on_write(mut self, sync: bool) -> Self {
-        self.sync_mode = if sync {
-            SyncMode::FsyncOnWrite
-        } else {
-            SyncMode::None
-        };
         self
     }
 }
@@ -75,13 +55,12 @@ pub struct WritePosition {
 /// 日志写入器
 ///
 /// 封装段管理和存储操作，提供统一的写入接口。
-/// 支持多种同步策略，根据配置决定何时执行 fsync。
+/// 同步策略由 WriteCoordinator 负责，本组件只执行写入和同步操作。
 pub struct LogWriter {
+    #[allow(dead_code)]
     config: LogWriterConfig,
     segment_manager: RwLock<SegmentManager>,
     active_storage: RwLock<Option<Arc<FileStorage>>>,
-    /// 同步上下文，跟踪同步状态
-    sync_context: RwLock<SyncContext>,
 }
 
 impl LogWriter {
@@ -90,13 +69,10 @@ impl LogWriter {
         let segment_manager = SegmentManager::new(config.segment_config.clone())
             .map_err(|e| Error::Generic(format!("Failed to create segment manager: {}", e)))?;
 
-        let sync_context = SyncContext::new(config.sync_mode);
-
         Ok(Self {
             config,
             segment_manager: RwLock::new(segment_manager),
             active_storage: RwLock::new(None),
-            sync_context: RwLock::new(sync_context),
         })
     }
 
@@ -189,15 +165,7 @@ impl LogWriter {
             *active = None;
         }
 
-        // 根据同步策略决定是否同步
-        let should_sync = {
-            let mut sync_ctx = self.sync_context.write().await;
-            sync_ctx.on_write()
-        };
-
-        if should_sync {
-            self.sync().await?;
-        }
+        // 同步决策由 WriteCoordinator 负责，本组件只负责写入
 
         Ok(WritePosition {
             segment_id,
@@ -285,15 +253,7 @@ impl LogWriter {
             }
         }
 
-        // 根据同步策略决定是否同步
-        let should_sync = {
-            let mut sync_ctx = self.sync_context.write().await;
-            sync_ctx.on_batch(data_list.len() as u64)
-        };
-
-        if should_sync {
-            self.sync().await?;
-        }
+        // 同步决策由 WriteCoordinator 负责，本组件只负责写入
 
         Ok(positions)
     }
@@ -327,16 +287,12 @@ impl LogWriter {
     /// 同步所有未持久化的数据
     ///
     /// 执行 fsync，确保数据持久化到磁盘。
+    /// 同步决策由 WriteCoordinator 负责，本方法只执行实际的 fsync 操作。
     pub async fn sync(&self) -> Result<()> {
         let storage = self.active_storage.read().await;
         if let Some(ref s) = *storage {
             s.sync().await?;
         }
-
-        // 记录同步完成
-        let mut sync_ctx = self.sync_context.write().await;
-        sync_ctx.on_synced();
-
         Ok(())
     }
 
@@ -345,11 +301,6 @@ impl LogWriter {
     /// 执行最后的同步操作。
     pub async fn close(&self) -> Result<()> {
         self.sync().await
-    }
-
-    /// 获取当前同步模式
-    pub fn sync_mode(&self) -> SyncMode {
-        self.config.sync_mode
     }
 }
 
@@ -456,120 +407,5 @@ mod tests {
         assert_eq!(positions[0].length, 1);
         assert_eq!(positions[1].length, 2);
         assert_eq!(positions[2].length, 3);
-    }
-
-    #[tokio::test]
-    async fn test_sync_mode_none() {
-        use crate::wal::SyncMode;
-
-        let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default()
-            .with_dir(temp_dir.path())
-            .with_sync_mode(SyncMode::None);
-
-        let writer = LogWriter::new(config).await.unwrap();
-        assert_eq!(writer.sync_mode(), SyncMode::None);
-
-        // 写入数据，不应该自动同步
-        writer.write(b"data1").await.unwrap();
-        writer.write(b"data2").await.unwrap();
-
-        // 手动同步应该成功
-        writer.sync().await.unwrap();
-        writer.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_sync_mode_fsync_on_write() {
-        use crate::wal::SyncMode;
-
-        let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default()
-            .with_dir(temp_dir.path())
-            .with_sync_mode(SyncMode::FsyncOnWrite);
-
-        let writer = LogWriter::new(config).await.unwrap();
-        assert_eq!(writer.sync_mode(), SyncMode::FsyncOnWrite);
-
-        // 每次写入都应该自动同步
-        writer.write(b"data1").await.unwrap();
-        writer.write(b"data2").await.unwrap();
-        writer.write(b"data3").await.unwrap();
-
-        // 验证数据已经持久化
-        writer.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_sync_mode_batch() {
-        use crate::wal::SyncMode;
-
-        let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default()
-            .with_dir(temp_dir.path())
-            .with_sync_mode(SyncMode::Batch { batch_size: 3 });
-
-        let writer = LogWriter::new(config).await.unwrap();
-        assert_eq!(writer.sync_mode(), SyncMode::Batch { batch_size: 3 });
-
-        // 前两次写入不应该触发同步
-        writer.write(b"data1").await.unwrap();
-        writer.write(b"data2").await.unwrap();
-
-        // 第三次写入应该触发同步
-        writer.write(b"data3").await.unwrap();
-
-        // 再写入几条，验证批量同步继续工作
-        writer.write(b"data4").await.unwrap();
-        writer.write(b"data5").await.unwrap();
-
-        writer.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_sync_on_write_backward_compatibility() {
-        use crate::wal::SyncMode;
-
-        let temp_dir = tempdir().unwrap();
-
-        // 测试 with_sync_on_write(true) 映射到 FsyncOnWrite
-        let config = LogWriterConfig::default()
-            .with_dir(temp_dir.path())
-            .with_sync_on_write(true);
-
-        let writer = LogWriter::new(config).await.unwrap();
-        assert_eq!(writer.sync_mode(), SyncMode::FsyncOnWrite);
-
-        // 测试 with_sync_on_write(false) 映射到 None
-        let temp_dir2 = tempdir().unwrap();
-        let config2 = LogWriterConfig::default()
-            .with_dir(temp_dir2.path())
-            .with_sync_on_write(false);
-
-        let writer2 = LogWriter::new(config2).await.unwrap();
-        assert_eq!(writer2.sync_mode(), SyncMode::None);
-    }
-
-    #[tokio::test]
-    async fn test_batch_write_with_batch_sync_mode() {
-        use crate::wal::SyncMode;
-
-        let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default()
-            .with_dir(temp_dir.path())
-            .with_max_segment_size(10000)
-            .with_sync_mode(SyncMode::Batch { batch_size: 5 });
-
-        let writer = LogWriter::new(config).await.unwrap();
-
-        // 批量写入 3 条，不应该触发同步（< 5）
-        let data_list: Vec<&[u8]> = vec![b"a", b"bb", b"ccc"];
-        writer.write_batch(&data_list).await.unwrap();
-
-        // 再批量写入 3 条，总共 6 条，应该触发一次同步（>= 5）
-        let data_list2: Vec<&[u8]> = vec![b"dddd", b"eeeee"];
-        writer.write_batch(&data_list2).await.unwrap();
-
-        writer.close().await.unwrap();
     }
 }

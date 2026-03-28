@@ -1,7 +1,7 @@
 # 代码 Review 问题记录
 
 **Review 日期**: 2025-01-09  
-**更新日期**: 2025-01-16
+**更新日期**: 2026-03-28
 
 ---
 
@@ -105,21 +105,31 @@ let mode = wal.sync_mode().await;
 
 ### 2. SyncStrategy 集成 ✅ 已完成
 
-**位置**: `src/wal/sync_strategy.rs`, `src/storage/log_writer.rs`, `src/wal/wal_manager.rs`
+**位置**: `src/wal/sync_strategy.rs`, `src/wal/coordinators.rs`, `src/wal/wal_manager.rs`
 
-**状态**: 已完全集成
+**状态**: 已完全集成并优化（2026-03-28 架构重构）
 
 **实现内容**:
-- `LogWriter` 现在使用 `SyncMode` 替代简单的 `bool sync_on_write`
+- ✅ **架构优化**: `LogWriter` 移除 `SyncMode`，只负责纯写入操作
+- ✅ **职责分离**: `WriteCoordinator` 唯一持有 `SyncContext`，负责同步决策
 - 支持四种同步模式：None, FsyncOnWrite, Periodic(interval_ms), Batch(batch_size)
-- `WalConfig` 和 `WalBuilder` 新增 `with_sync_mode()` API
-- 保持向后兼容：`with_sync_on_write(true/false)` 自动映射到 FsyncOnWrite/None
-- `LogWriter` 新增 `sync_stats()` 和 `sync_mode()` 方法用于监控
+- `WalConfig` 和 `WalBuilder` 保留 `with_sync_mode()` API
+- `LogWriterConfig` 移除 `with_sync_mode()` 和 `with_sync_on_write()`（不再相关）
+
+**分层架构**:
+```
+L4 API层 (WalManager) → L3 协调层 (WriteCoordinator) → L2 存储层 (LogWriter) → L1 存储引擎
+                              ↓
+                         SyncContext (决策何时 sync)
+                              ↓
+                         调用 LogWriter.sync() (执行)
+```
 
 **教学价值**:
 - 展示策略模式在实际组件中的集成
-- 演示如何在保持 API 兼容的同时升级功能
+- 演示清晰的架构分层：决策层 vs 执行层
 - 提供同步性能与数据安全的权衡实践
+- 展示状态去重和职责分离的设计
 
 ---
 
@@ -133,7 +143,8 @@ let mode = wal.sync_mode().await;
 - 协调器协作测试
 - 检查点创建/加载/删除流程测试
 - 段轮转期间并发读写测试
-- **新增**: 不同 SyncMode 的性能对比测试
+- 不同 SyncMode 的性能对比测试
+- **新增**: 预读优化测试（ReadAheadBuffer 填充/读取/边界情况）
 
 ---
 
@@ -146,4 +157,24 @@ let mode = wal.sync_mode().await;
 
 ---
 
-*Review 更新 - 2025-01-16*
+### 4. 预读优化修复 ✅ 已完成
+
+**位置**: `src/wal/coordinators.rs` - `ReadCoordinator`
+
+**状态**: 已修复（2026-03-28）
+
+**问题**:
+1. `ReadCoordinator::with_read_ahead()` 是空实现，只设置了 `read_ahead_size` 但没有重新初始化 `ReadAheadBuffer`
+2. `ReadAheadBuffer::read()` 方法缺少 Magic 验证，可能导致解析错误
+3. `seek_to_start()` 方法存在死锁：持有 `read_ahead_buffer` 写锁时调用 `fill_buffer()`
+
+**修复内容**:
+- ✅ `with_read_ahead()` 现在正确重新初始化 `ReadAheadBuffer`
+- ✅ `ReadAheadBuffer` 移除冗余的 `size` 字段，使用容量管理
+- ✅ `read()` 方法添加 Magic 验证，确保格式正确
+- ✅ `seek_to_start()` 修复锁嵌套，使用代码块及时释放锁
+- ✅ `fill_buffer()` 简化逻辑，只在缓冲区为空时填充
+
+---
+
+*Review 更新 - 2026-03-28*
