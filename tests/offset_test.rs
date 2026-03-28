@@ -1,4 +1,4 @@
-use easy_wal::WalBuilder;
+use easy_wal::{SyncMode, WalBuilder};
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -10,7 +10,7 @@ async fn test_write_vs_write_batch_offset() {
     // 第一个 WAL：使用 write
     let wal1 = WalBuilder::new()
         .with_dir(temp_dir1.path())
-        .with_sync_on_write(true)
+        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -24,7 +24,7 @@ async fn test_write_vs_write_batch_offset() {
     // 第二个 WAL：使用 write_batch
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir2.path())
-        .with_sync_on_write(true)
+        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();

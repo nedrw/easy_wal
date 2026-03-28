@@ -6,13 +6,6 @@
   - 创建 `benches/bench.rs`
   - 启用 Cargo.toml bench 配置
 
-- [ ] 补充集成测试
-  - WalManager 完整生命周期测试
-  - RecoveryManager 场景测试
-  - 协调器协作测试
-  - 不同 SyncMode 的性能对比测试
-  - 配置热更新场景测试
-
 ## 已完成
 
 - [x] 删除重复的 storage/wal_manager.rs
@@ -34,11 +27,19 @@
   - 修复 `seek_to_start()` 死锁问题（锁嵌套调用）
   - 修复 `ReadAheadBuffer::read()` Magic 验证逻辑
   - `ReadAheadBuffer` 移除冗余的 `size` 字段
-- [x] SyncContext 状态去重 (2026-03-28)
-  - `LogWriter` 移除 `sync_mode` 字段，只负责纯写入操作
-  - `LogWriterConfig` 移除 `with_sync_mode()` 和 `with_sync_on_write()` API
-  - `WriteCoordinator` 是唯一持有 `SyncContext` 的组件
-  - 明确分层：L3 协调层负责决策，L2 存储层负责执行
+- [x] 补充集成测试 (2026-03-28)
+  - WalManager 完整生命周期测试
+  - RecoveryManager 场景测试
+  - 协调器协作测试
+  - 不同 SyncMode 的性能对比测试
+  - 配置热更新场景测试
+- [x] 同步 API 精简 (2026-03-28)
+  - `WalConfig` 移除 `periodic_sync_interval_ms` 冗余字段
+  - `WalConfig::with_periodic_sync_interval()` 已移除
+  - `WalBuilder::with_periodic_sync_interval()` 已移除
+  - `WalConfig::with_sync_on_write()` 已移除
+  - `WalBuilder::with_sync_on_write()` 已移除
+  - 统一使用 `with_sync_mode(SyncMode::...)` 接口
 - [x] 配置热更新和监控增强 (2025-01-16)
   - 配置与运行时状态分离设计
   - 新增 `WalManager::sync_mode()` 查询当前同步模式

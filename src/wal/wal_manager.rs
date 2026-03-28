@@ -27,9 +27,6 @@ pub struct WalConfig {
     pub batch_size: usize,
     /// 预读缓冲区大小
     pub read_ahead_size: usize,
-    /// 周期同步间隔（毫秒），仅在 SyncMode::Periodic 时使用
-    /// 设置后会自动启动后台任务执行定期同步
-    pub periodic_sync_interval_ms: Option<u64>,
 }
 
 impl Default for WalConfig {
@@ -40,7 +37,6 @@ impl Default for WalConfig {
             sync_mode: SyncMode::None,
             batch_size: 100,
             read_ahead_size: 64 * 1024, // 64KB
-            periodic_sync_interval_ms: None,
         }
     }
 }
@@ -62,16 +58,6 @@ impl WalConfig {
         self
     }
 
-    /// 兼容旧 API：设置是否每次写入后同步
-    pub fn with_sync_on_write(mut self, sync: bool) -> Self {
-        self.sync_mode = if sync {
-            SyncMode::FsyncOnWrite
-        } else {
-            SyncMode::None
-        };
-        self
-    }
-
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.batch_size = size;
         self
@@ -79,16 +65,6 @@ impl WalConfig {
 
     pub fn with_read_ahead_size(mut self, size: usize) -> Self {
         self.read_ahead_size = size;
-        self
-    }
-
-    /// 设置周期同步间隔（毫秒）
-    ///
-    /// 设置后会自动启动后台任务执行定期同步。
-    /// 这是一个便捷方法，会同时设置 `sync_mode` 为 `Periodic`。
-    pub fn with_periodic_sync_interval(mut self, interval_ms: u64) -> Self {
-        self.periodic_sync_interval_ms = Some(interval_ms);
-        self.sync_mode = SyncMode::Periodic { interval_ms };
         self
     }
 }
@@ -146,7 +122,7 @@ impl WalManager {
 
         // 如果配置了周期同步，启动后台任务
         let (shutdown_tx, periodic_sync_handle) =
-            if let Some(interval_ms) = config.periodic_sync_interval_ms {
+            if let SyncMode::Periodic { interval_ms } = config.sync_mode {
                 let (tx, rx) = tokio::sync::watch::channel(false);
                 let coordinator = write_coordinator.clone();
 
@@ -361,11 +337,6 @@ impl WalBuilder {
         self
     }
 
-    pub fn with_sync_on_write(mut self, sync: bool) -> Self {
-        self.config = self.config.with_sync_on_write(sync);
-        self
-    }
-
     pub fn with_sync_mode(mut self, mode: SyncMode) -> Self {
         self.config = self.config.with_sync_mode(mode);
         self
@@ -378,11 +349,6 @@ impl WalBuilder {
 
     pub fn with_read_ahead_size(mut self, size: usize) -> Self {
         self.config.read_ahead_size = size;
-        self
-    }
-
-    pub fn with_periodic_sync_interval(mut self, interval_ms: u64) -> Self {
-        self.config = self.config.with_periodic_sync_interval(interval_ms);
         self
     }
 
@@ -408,7 +374,7 @@ mod tests {
 
         let wal = WalBuilder::new()
             .with_dir(temp_dir.path())
-            .with_sync_on_write(true)
+            .with_sync_mode(SyncMode::FsyncOnWrite)
             .build()
             .await
             .unwrap();
@@ -433,7 +399,7 @@ mod tests {
 
         let wal = WalBuilder::new()
             .with_dir(temp_dir.path())
-            .with_sync_on_write(true)
+            .with_sync_mode(SyncMode::FsyncOnWrite)
             .build()
             .await
             .unwrap();
@@ -460,7 +426,7 @@ mod tests {
 
         let wal = WalBuilder::new()
             .with_dir(temp_dir.path())
-            .with_sync_on_write(true)
+            .with_sync_mode(SyncMode::FsyncOnWrite)
             .build()
             .await
             .unwrap();
@@ -484,7 +450,7 @@ mod tests {
         let wal = WalBuilder::new()
             .with_dir(temp_dir.path())
             .with_max_segment_size(10)
-            .with_sync_on_write(true)
+            .with_sync_mode(SyncMode::FsyncOnWrite)
             .build()
             .await
             .unwrap();
@@ -500,17 +466,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_wal_periodic_sync_builtin() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
         let temp_dir = tempdir().unwrap();
-        let sync_called = Arc::new(AtomicBool::new(false));
-        let sync_called_clone = sync_called.clone();
 
         // 使用内置周期同步，间隔 50ms
         let wal = WalBuilder::new()
             .with_dir(temp_dir.path())
-            .with_periodic_sync_interval(50)
+            .with_sync_mode(SyncMode::Periodic { interval_ms: 50 })
             .build()
             .await
             .unwrap();
