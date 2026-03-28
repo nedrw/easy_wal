@@ -14,15 +14,22 @@ use tokio::sync::RwLock;
 /// 最大单条记录大小 (64MB)
 const MAX_RECORD_SIZE: u64 = 64 * 1024 * 1024;
 
-/// Sync 完成回调类型
-///
-/// 回调会在每次 sync 操作完成后被调用，无论成功或失败。
-/// 回调参数为 (duration_ms, error)，error 为 None 表示成功。
-pub type SyncCallback = Box<dyn Fn(u64, Option<String>) + Send + Sync>;
-
 // ============================================================
 // 写入协调器
 // ============================================================
+
+/// 同步报告
+///
+/// 包含同步操作的执行结果信息。
+#[derive(Debug, Clone)]
+pub struct SyncReport {
+    /// 同步耗时（毫秒）
+    pub duration_ms: u64,
+    /// 是否成功
+    pub success: bool,
+    /// 错误信息（仅在 success 为 false 时有值）
+    pub error: Option<String>,
+}
 
 /// 写入协调器
 ///
@@ -35,8 +42,6 @@ pub struct WriteCoordinator {
     sync_context: RwLock<SyncContext>,
     /// 同步统计信息
     sync_stats: RwLock<SyncStats>,
-    /// Sync 完成回调
-    sync_callback: RwLock<Option<SyncCallback>>,
 }
 
 impl WriteCoordinator {
@@ -46,24 +51,6 @@ impl WriteCoordinator {
             writer,
             sync_context: RwLock::new(SyncContext::new(sync_mode)),
             sync_stats: RwLock::new(SyncStats::new()),
-            sync_callback: RwLock::new(None),
-        }
-    }
-
-    /// 设置 Sync 完成回调
-    ///
-    /// 回调会在每次 sync 操作完成后被调用，包括成功和失败的情况。
-    /// 设置新的回调会替换旧的回调。传入 `None` 可以清除回调。
-    pub async fn set_sync_callback(&self, callback: Option<SyncCallback>) {
-        let mut cb = self.sync_callback.write().await;
-        *cb = callback;
-    }
-
-    /// 发送 Sync 完成事件（内部使用）
-    async fn notify_sync_complete(&self, duration_ms: u64, error: Option<String>) {
-        let cb = self.sync_callback.read().await;
-        if let Some(callback) = cb.as_ref() {
-            callback(duration_ms, error);
         }
     }
 
@@ -185,12 +172,13 @@ impl WriteCoordinator {
     /// 强制同步
     ///
     /// 立即执行 fsync，忽略同步策略。
-    pub async fn sync(&self) -> Result<()> {
+    /// 返回同步报告，包含耗时和执行结果。
+    pub async fn sync(&self) -> Result<SyncReport> {
         self.do_sync().await
     }
 
     /// 执行实际的同步操作
-    async fn do_sync(&self) -> Result<()> {
+    async fn do_sync(&self) -> Result<SyncReport> {
         let start = std::time::Instant::now();
         let result = self.writer.sync().await;
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -209,18 +197,18 @@ impl WriteCoordinator {
                     stats.record(duration_ms);
                 }
 
-                // 通知回调
-                self.notify_sync_complete(duration_ms, None).await;
+                Ok(SyncReport {
+                    duration_ms,
+                    success: true,
+                    error: None,
+                })
             }
-            Err(e) => {
-                // 通知回调失败
-                self.notify_sync_complete(duration_ms, Some(e.to_string()))
-                    .await;
-                return Err(e);
-            }
+            Err(e) => Ok(SyncReport {
+                duration_ms,
+                success: false,
+                error: Some(e.to_string()),
+            }),
         }
-
-        Ok(())
     }
 
     /// 强制轮转段
@@ -567,42 +555,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_callback() {
+    async fn test_sync_returns_report() {
         let temp_dir = tempdir().unwrap();
         let config = LogWriterConfig::default().with_dir(temp_dir.path());
 
         let writer = Arc::new(LogWriter::new(config).await.unwrap());
         let coordinator = WriteCoordinator::new(writer, SyncMode::FsyncOnWrite);
 
-        // 用于接收回调数据的通道
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Option<String>)>(10);
-
-        // 设置回调
-        coordinator
-            .set_sync_callback(Some(Box::new(move |duration_ms, error| {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    tx.send((duration_ms, error)).await.ok();
-                });
-            })))
-            .await;
-
         // 写入数据触发同步
         coordinator.write(b"test data").await.unwrap();
 
-        // 等待回调被调用
-        let (duration_ms, error) = rx.recv().await.unwrap();
-        assert!(duration_ms > 0);
-        assert!(error.is_none());
-
-        // 清除回调
-        coordinator.set_sync_callback(None).await;
-
-        // 再次写入不应该触发回调（因为已清除）
-        coordinator.write(b"more data").await.unwrap();
-
-        // 给一点时间确保没有回调
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // 手动同步并获取报告
+        let report = coordinator.sync().await.unwrap();
+        assert!(report.duration_ms > 0);
+        assert!(report.success);
+        assert!(report.error.is_none());
 
         coordinator.close().await.unwrap();
     }

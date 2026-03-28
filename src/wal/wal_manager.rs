@@ -232,7 +232,9 @@ impl WalManager {
     }
 
     /// 同步数据
-    pub async fn sync(&self) -> Result<()> {
+    ///
+    /// 返回同步报告，包含耗时和执行结果。
+    pub async fn sync(&self) -> Result<super::coordinators::SyncReport> {
         self.write_coordinator.sync().await
     }
 
