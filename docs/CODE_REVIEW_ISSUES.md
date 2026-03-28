@@ -103,21 +103,39 @@
 
 ---
 
-### P3 - LogReader::read_next IO 效率问题
+### P3 - LogReader::read_next IO 效率问题 ✅ 已完成
 
-**位置**: `src/storage/log_reader.rs#L136-175`
+**位置**: `src/storage/log_reader.rs`
 
-**问题**: 当前实现分 4 次独立 IO 读取（Magic、Length、CRC32、Data），每次 read 都是独立的系统调用，如果记录被截断可能读到无效数据。
+**修复内容**:
+
+1. **IO 优化**：将 4 次独立 IO 减少为 2 次
+   - 预读整个记录头（12 bytes: Magic + Length + CRC32）
+   - 在内存中解析 header，避免多次系统调用
 
 ```rust
-// 当前实现
-let magic_bytes = storage.read(offset, 4).await?;      // IO 1
-let length_bytes = storage.read(offset + 4, 4).await?;  // IO 2
-let crc_bytes = storage.read(crc_offset, 4).await?;    // IO 3
-let data = storage.read(data_offset, length).await?;    // IO 4
+// 修复后：2 次 IO
+let header = storage.read(offset, format::RECORD_HEADER_SIZE).await?;  // IO 1
+let data = storage.read(data_offset, length).await?;                    // IO 2
 ```
 
-**建议修复**: 预读整个记录头（12 bytes），在内存中解析。
+2. **完整性保护**：新增读取长度验证，防止 IO 中途截断
+
+```rust
+// 完整性保护：验证实际读取的字节数与声明的长度一致
+if data.len() as u64 != length {
+    return Err(Error::Generic(format!(
+        "Incomplete read: expected {} bytes, got {}",
+        length,
+        data.len()
+    )));
+}
+```
+
+3. **防御层级**：
+   - Magic 验证 → 确认有效记录起点
+   - Length 范围验证 → 长度合理性和完整性
+   - CRC32 验证 → 数据内容完整性
 
 ---
 

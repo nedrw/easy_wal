@@ -205,17 +205,15 @@ impl LogReader {
 
         let storage = self.get_storage_for_segment(segment_id).await?;
 
-        // 读取 Magic (4 bytes)
-        let magic_bytes = storage.read(offset, 4).await?;
-        if magic_bytes.len() < 4 {
+        // 预读整个记录头 (12 bytes: 4 magic + 4 length + 4 crc)
+        // 优化：从 4 次独立 IO 减少为 2 次（1 次预读头 + 1 次读数据）
+        let header = storage.read(offset, format::RECORD_HEADER_SIZE).await?;
+        if header.len() < format::RECORD_HEADER_SIZE as usize {
             return Err(Error::Eof);
         }
-        let magic = u32::from_be_bytes([
-            magic_bytes[0],
-            magic_bytes[1],
-            magic_bytes[2],
-            magic_bytes[3],
-        ]);
+
+        // 解析 Magic
+        let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
         if magic != format::RECORD_MAGIC {
             return Err(Error::Generic(format!(
                 "Invalid record magic: {:08x}",
@@ -223,35 +221,30 @@ impl LogReader {
             )));
         }
 
-        // 读取长度 (4 bytes)
-        let length_bytes = storage.read(offset + 4, 4).await?;
-        if length_bytes.len() < 4 {
-            return Err(Error::Eof);
-        }
-        let length = u32::from_be_bytes([
-            length_bytes[0],
-            length_bytes[1],
-            length_bytes[2],
-            length_bytes[3],
-        ]) as u64;
+        // 解析 Length
+        let length = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as u64;
 
         // 验证长度合理性
         if length == 0 || length > format::MAX_RECORD_SIZE {
             return Err(Error::Generic(format!("Invalid record length: {}", length)));
         }
 
-        // 读取 CRC32 (4 bytes)
-        let crc_offset = offset + 8;
-        let crc_bytes = storage.read(crc_offset, 4).await?;
-        if crc_bytes.len() < 4 {
-            return Err(Error::Eof);
-        }
-        let expected_crc =
-            u32::from_be_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+        // 解析 CRC32
+        let expected_crc = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
 
         // 读取数据
         let data_offset = offset + format::RECORD_HEADER_SIZE;
         let data = storage.read(data_offset, length).await?;
+
+        // 完整性保护：验证实际读取的字节数与声明的长度一致
+        // 防止 IO 中途文件被截断导致读到不完整数据
+        if data.len() as u64 != length {
+            return Err(Error::Generic(format!(
+                "Incomplete read: expected {} bytes, got {}",
+                length,
+                data.len()
+            )));
+        }
 
         // 验证 CRC32
         let actual_crc = crc32(&data);
