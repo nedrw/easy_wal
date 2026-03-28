@@ -17,13 +17,6 @@
 //! - Layer 2: 组件化设计、状态管理、并发控制
 //! - Layer 3: 协调器模式、恢复机制、生命周期管理
 //! - Layer 4: API 设计、Builder 模式、用户体验
-//!
-//! # 当前状态
-//!
-//! Phase 3: 读取功能 (已完成)
-//! - ✅ LogReader 实现
-//! - ✅ 批量顺序读取
-//! - ✅ WalManager::read()
 
 mod error;
 mod prelude;
