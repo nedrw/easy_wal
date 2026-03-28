@@ -6,10 +6,6 @@
 ///
 /// 使用 CRC32-IEEE 多项式 (0xEDB88320)
 /// 这是最广泛使用的 CRC32 标准，与 Ethernet, ZIP 等兼容。
-/// CRC32 校验和计算器
-///
-/// 使用 CRC32-IEEE 多项式 (0xEDB88320)
-/// 这是最广泛使用的 CRC32 标准，与 Ethernet, ZIP 等兼容。
 #[derive(Debug, Clone)]
 pub struct Crc32 {
     /// CRC 查找表

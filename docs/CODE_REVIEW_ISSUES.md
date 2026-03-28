@@ -161,12 +161,14 @@ if data.len() as u64 != length {
 
 ---
 
-### P4 - checksum.rs 重复注释
+### P4 - checksum.rs 重复注释 ✅ 已完成
 
 **位置**: `src/storage/checksum.rs#L9-12`
 
-**问题**: 文档注释重复。
+**修复内容**:
+- 删除重复的文档注释行
 
+**修复前**:
 ```rust
 /// CRC32 校验和计算器
 ///
@@ -175,6 +177,16 @@ if data.len() as u64 != length {
 /// CRC32 校验和计算器  <-- 重复
 ///
 /// 使用 CRC32-IEEE 多项式 (0xEDB88320)  <-- 重复
+```
+
+**修复后**:
+```rust
+/// CRC32 校验和计算器
+///
+/// 使用 CRC32-IEEE 多项式 (0xEDB88320)
+/// 这是最广泛使用的 CRC32 标准，与 Ethernet, ZIP 等兼容。
+#[derive(Debug, Clone)]
+pub struct Crc32 {
 ```
 
 ---
@@ -190,7 +202,7 @@ if data.len() as u64 != length {
 | P3 | LogReader::read_next IO 效率 | 低 |
 | P3 | 缺少 sync 回调 | 低 |
 | P3 | ReadAheadBuffer 边界 | 低 |
-| P4 | checksum.rs 重复注释 | 低 |
+| P4 | checksum.rs 重复注释 | ✅ 已完成 |
 
 ---
 
