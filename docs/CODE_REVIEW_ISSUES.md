@@ -139,25 +139,45 @@ if data.len() as u64 != length {
 
 ---
 
-### P3 - 缺少 sync 完成回调
+### P3 - 缺少 sync 完成回调 ✅ 已完成
 
 **位置**: `src/wal/coordinators.rs`
 
-**问题**: `WriteCoordinator::do_sync` 执行 fsync 但没有回调钩子，外部无法感知同步完成。
+**修复内容**:
+1. 添加 `SyncCallback` 类型别名：`Box<dyn Fn(u64, Option<String>) + Send + Sync>`
+   - 回调参数为 `(duration_ms, error)`，error 为 None 表示成功
+2. 在 `WriteCoordinator` 中添加 `sync_callback: RwLock<Option<SyncCallback>>` 字段
+3. 添加 `set_sync_callback()` 方法，允许外部设置/清除回调
+4. 修改 `do_sync()` 方法，在 sync 完成（成功或失败）后调用回调
+5. 添加 `test_sync_callback` 测试用例验证回调功能
 
-**建议修复**: 添加 `on_sync_complete` 回调或事件。
+**使用示例**:
+```rust
+let coordinator = WriteCoordinator::new(writer, SyncMode::FsyncOnWrite);
+
+coordinator.set_sync_callback(Some(Box::new(|duration_ms, error| {
+    println!("Sync completed in {}ms, error: {:?}", duration_ms, error);
+}))).await;
+
+coordinator.write(b"data").await.unwrap(); // 写入后触发回调
+```
 
 ---
 
-### P3 - ReadAheadBuffer 边界情况
+### P3 - ReadAheadBuffer 边界情况 ✅ 已完成
 
-**位置**: `src/wal/coordinators.rs#L258-294`
+**位置**: `src/wal/coordinators.rs`
 
-**问题**: 当 buffer 中残留不完整记录时（只能容纳部分记录），`has_data()` 返回 true 但 `read()` 返回 None。导致 `fill_buffer` 认为有数据不重新填充，提前返回 EOF。
+**修复内容**:
+1. 在 `ReadAheadBuffer` 结构体中添加 `has_incomplete: bool` 字段，标记缓冲区是否有残留的不完整数据
+2. 修改 `has_data()` 方法：当 `has_incomplete` 为 true 时返回 false，强制重新填充缓冲区
+3. 修改 `read()` 方法：当记录不完整时设置 `has_incomplete = true`
+4. 修改 `fill()` 方法：填充新数据时重置 `has_incomplete = false`
 
-**复现**: 64KB buffer / 1036 bytes per record ≈ 63 条记录，第 64 条不完整时触发。
-
-**建议修复**: 当 `read()` 返回 None 时清空 buffer，强制重新填充。
+**修复说明**: 
+- 当 buffer 中残留不完整记录时（只能容纳部分记录），`read()` 返回 None 但 `has_data()` 仍返回 true
+- 这导致 `fill_buffer` 认为有数据不重新填充，提前返回 EOF
+- 通过添加 `has_incomplete` 标记，在 `read()` 遇到不完整记录时设置该标记，使 `has_data()` 返回 false，从而强制重新填充缓冲区
 
 ---
 
@@ -201,7 +221,7 @@ pub struct Crc32 {
 | P3 | 段轮转竞态条件 | 中 |
 | P3 | LogReader::read_next IO 效率 | 低 |
 | P3 | 缺少 sync 回调 | 低 |
-| P3 | ReadAheadBuffer 边界 | 低 |
+| P3 | ReadAheadBuffer 边界 | ✅ 已完成 |
 | P4 | checksum.rs 重复注释 | ✅ 已完成 |
 
 ---

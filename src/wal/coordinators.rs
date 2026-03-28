@@ -14,6 +14,12 @@ use tokio::sync::RwLock;
 /// 最大单条记录大小 (64MB)
 const MAX_RECORD_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Sync 完成回调类型
+///
+/// 回调会在每次 sync 操作完成后被调用，无论成功或失败。
+/// 回调参数为 (duration_ms, error)，error 为 None 表示成功。
+pub type SyncCallback = Box<dyn Fn(u64, Option<String>) + Send + Sync>;
+
 // ============================================================
 // 写入协调器
 // ============================================================
@@ -29,6 +35,8 @@ pub struct WriteCoordinator {
     sync_context: RwLock<SyncContext>,
     /// 同步统计信息
     sync_stats: RwLock<SyncStats>,
+    /// Sync 完成回调
+    sync_callback: RwLock<Option<SyncCallback>>,
 }
 
 impl WriteCoordinator {
@@ -38,6 +46,24 @@ impl WriteCoordinator {
             writer,
             sync_context: RwLock::new(SyncContext::new(sync_mode)),
             sync_stats: RwLock::new(SyncStats::new()),
+            sync_callback: RwLock::new(None),
+        }
+    }
+
+    /// 设置 Sync 完成回调
+    ///
+    /// 回调会在每次 sync 操作完成后被调用，包括成功和失败的情况。
+    /// 设置新的回调会替换旧的回调。传入 `None` 可以清除回调。
+    pub async fn set_sync_callback(&self, callback: Option<SyncCallback>) {
+        let mut cb = self.sync_callback.write().await;
+        *cb = callback;
+    }
+
+    /// 发送 Sync 完成事件（内部使用）
+    async fn notify_sync_complete(&self, duration_ms: u64, error: Option<String>) {
+        let cb = self.sync_callback.read().await;
+        if let Some(callback) = cb.as_ref() {
+            callback(duration_ms, error);
         }
     }
 
@@ -166,19 +192,32 @@ impl WriteCoordinator {
     /// 执行实际的同步操作
     async fn do_sync(&self) -> Result<()> {
         let start = std::time::Instant::now();
-        self.writer.sync().await?;
+        let result = self.writer.sync().await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        // 更新策略状态
-        {
-            let mut ctx = self.sync_context.write().await;
-            ctx.on_synced();
-        }
+        match result {
+            Ok(()) => {
+                // 更新策略状态
+                {
+                    let mut ctx = self.sync_context.write().await;
+                    ctx.on_synced();
+                }
 
-        // 更新统计信息
-        {
-            let mut stats = self.sync_stats.write().await;
-            stats.record(duration_ms);
+                // 更新统计信息
+                {
+                    let mut stats = self.sync_stats.write().await;
+                    stats.record(duration_ms);
+                }
+
+                // 通知回调
+                self.notify_sync_complete(duration_ms, None).await;
+            }
+            Err(e) => {
+                // 通知回调失败
+                self.notify_sync_complete(duration_ms, Some(e.to_string()))
+                    .await;
+                return Err(e);
+            }
         }
 
         Ok(())
@@ -231,6 +270,8 @@ struct ReadAheadBuffer {
     pos: usize,
     /// 是否已耗尽
     exhausted: bool,
+    /// 是否有残留的不完整数据（无法解析出完整记录）
+    has_incomplete: bool,
 }
 
 impl ReadAheadBuffer {
@@ -239,6 +280,7 @@ impl ReadAheadBuffer {
             data: Vec::with_capacity(capacity),
             pos: 0,
             exhausted: false,
+            has_incomplete: false,
         }
     }
 
@@ -247,10 +289,16 @@ impl ReadAheadBuffer {
         self.data.clear();
         self.pos = 0;
         self.exhausted = false;
+        self.has_incomplete = false;
     }
 
-    /// 检查缓冲区是否有数据
+    /// 检查缓冲区是否有可用的完整数据
+    /// 如果有残留的不完整数据，返回 false 以强制重新填充
     fn has_data(&self) -> bool {
+        // 有不完整的残留数据时，返回 false 强制重新填充
+        if self.has_incomplete {
+            return false;
+        }
         self.pos < self.data.len()
     }
 
@@ -282,6 +330,8 @@ impl ReadAheadBuffer {
         // 验证数据完整性
         let record_size = 4 + 4 + 4 + length; // magic + length + crc + data
         if self.pos + record_size > self.data.len() {
+            // 标记有残留不完整数据，下次 has_data() 将返回 false
+            self.has_incomplete = true;
             return None;
         }
 
@@ -298,6 +348,7 @@ impl ReadAheadBuffer {
         self.data = data;
         self.pos = 0;
         self.exhausted = false;
+        self.has_incomplete = false;
     }
 }
 
@@ -511,6 +562,47 @@ mod tests {
 
         let stats = coordinator.sync_stats().await;
         assert_eq!(stats.sync_count, 2);
+
+        coordinator.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sync_callback() {
+        let temp_dir = tempdir().unwrap();
+        let config = LogWriterConfig::default().with_dir(temp_dir.path());
+
+        let writer = Arc::new(LogWriter::new(config).await.unwrap());
+        let coordinator = WriteCoordinator::new(writer, SyncMode::FsyncOnWrite);
+
+        // 用于接收回调数据的通道
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Option<String>)>(10);
+
+        // 设置回调
+        coordinator
+            .set_sync_callback(Some(Box::new(move |duration_ms, error| {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    tx.send((duration_ms, error)).await.ok();
+                });
+            })))
+            .await;
+
+        // 写入数据触发同步
+        coordinator.write(b"test data").await.unwrap();
+
+        // 等待回调被调用
+        let (duration_ms, error) = rx.recv().await.unwrap();
+        assert!(duration_ms > 0);
+        assert!(error.is_none());
+
+        // 清除回调
+        coordinator.set_sync_callback(None).await;
+
+        // 再次写入不应该触发回调（因为已清除）
+        coordinator.write(b"more data").await.unwrap();
+
+        // 给一点时间确保没有回调
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         coordinator.close().await.unwrap();
     }
