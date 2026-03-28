@@ -86,8 +86,6 @@ pub struct WalManager {
     read_coordinator: Arc<ReadCoordinator>,
     recovery_manager: RecoveryManager,
     config: WalConfig,
-    /// 用于取消后台任务的句柄
-    periodic_sync_handle: Option<tokio::task::JoinHandle<()>>,
     /// 优雅关闭信号
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 }
@@ -121,43 +119,41 @@ impl WalManager {
         let recovery_manager = RecoveryManager::new(&config.dir);
 
         // 如果配置了周期同步，启动后台任务
-        let (shutdown_tx, periodic_sync_handle) =
-            if let SyncMode::Periodic { interval_ms } = config.sync_mode {
-                let (tx, rx) = tokio::sync::watch::channel(false);
-                let coordinator = write_coordinator.clone();
+        let shutdown_tx = if let SyncMode::Periodic { interval_ms } = config.sync_mode {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let coordinator = write_coordinator.clone();
 
-                let handle = tokio::spawn(async move {
-                    let interval = tokio::time::Duration::from_millis(interval_ms);
-                    let mut rx = rx;
+            tokio::spawn(async move {
+                let interval = tokio::time::Duration::from_millis(interval_ms);
+                let mut rx = rx;
 
-                    loop {
-                        tokio::select! {
-                            _ = tokio::time::sleep(interval) => {
-                                if let Err(e) = coordinator.check_periodic_sync().await {
-                                    tracing::warn!("Periodic sync failed: {}", e);
-                                }
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(interval) => {
+                            if let Err(e) = coordinator.check_periodic_sync().await {
+                                tracing::warn!("Periodic sync failed: {}", e);
                             }
-                            _ = rx.changed() => {
-                                if *rx.borrow() {
-                                    tracing::debug!("Periodic sync task received shutdown signal");
-                                    break;
-                                }
+                        }
+                        _ = rx.changed() => {
+                            if *rx.borrow() {
+                                tracing::debug!("Periodic sync task received shutdown signal");
+                                break;
                             }
                         }
                     }
-                });
+                }
+            });
 
-                (Some(tx), Some(handle))
-            } else {
-                (None, None)
-            };
+            Some(tx)
+        } else {
+            None
+        };
 
         Ok(Self {
             write_coordinator,
             read_coordinator,
             recovery_manager,
             config,
-            periodic_sync_handle,
             shutdown_tx,
         })
     }
@@ -268,12 +264,10 @@ impl WalManager {
 
     /// 关闭 WAL
     pub async fn close(&self) -> Result<()> {
-        // 停止后台定时同步任务
+        // 发送关闭信号让后台周期同步任务自然退出
         if let Some(ref tx) = self.shutdown_tx {
             let _ = tx.send(true);
         }
-        // 注意：不等待任务完成，让它自然结束
-        // 这可能导致少量数据未同步，但保证了 close 不会阻塞
 
         self.write_coordinator.close().await?;
         self.read_coordinator.close().await
