@@ -67,6 +67,8 @@ impl Checkpoint {
     }
 
     /// 序列化检查点
+    ///
+    /// 格式：[4B version][8B timestamp][24B position][4B sealed_count][N*8B sealed_segments][4B crc32]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
@@ -76,7 +78,7 @@ impl Checkpoint {
         // timestamp (8 bytes)
         bytes.extend_from_slice(&self.timestamp.to_be_bytes());
 
-        // last_valid_position
+        // last_valid_position (24 bytes: segment_id + offset + last_record_start)
         bytes.extend_from_slice(&self.last_valid_position.segment_id.to_be_bytes());
         bytes.extend_from_slice(&self.last_valid_position.offset.to_be_bytes());
         bytes.extend_from_slice(&self.last_valid_position.last_record_start.to_be_bytes());
@@ -89,13 +91,34 @@ impl Checkpoint {
             bytes.extend_from_slice(&seg_id.to_be_bytes());
         }
 
+        // 计算并追加 CRC32 校验和
+        let crc = crc32(&bytes);
+        bytes.extend_from_slice(&crc.to_be_bytes());
+
         bytes
     }
 
     /// 从字节流反序列化
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 32 {
+        // 最小长度：version(4) + timestamp(8) + position(24) + sealed_count(4) + crc(4) = 44
+        if bytes.len() < 44 {
             return Err(Error::Generic("Invalid checkpoint data".into()));
+        }
+
+        // 验证 CRC32
+        let crc_offset = bytes.len() - 4;
+        let stored_crc = u32::from_be_bytes([
+            bytes[crc_offset],
+            bytes[crc_offset + 1],
+            bytes[crc_offset + 2],
+            bytes[crc_offset + 3],
+        ]);
+        let computed_crc = crc32(&bytes[..crc_offset]);
+        if stored_crc != computed_crc {
+            return Err(Error::ChecksumMismatch {
+                expected: stored_crc,
+                actual: computed_crc,
+            });
         }
 
         let mut offset = 0;
@@ -585,10 +608,8 @@ impl RecoveryManager {
                     }
                 }
 
-                // 防止无限循环（如果连续损坏太多）
-                if corrupted_skipped > 1000 && offset == 0 {
-                    break;
-                }
+                // 注：已移除无效保护条件（offset == 0 永远不为真）
+                // 循环有 file_size 限制，不会真正无限循环
             }
 
             // 如果段文件有部分写入但已损坏，截断

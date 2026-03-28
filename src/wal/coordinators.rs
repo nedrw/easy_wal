@@ -203,11 +203,10 @@ impl WriteCoordinator {
                     error: None,
                 })
             }
-            Err(e) => Ok(SyncReport {
-                duration_ms,
-                success: false,
-                error: Some(e.to_string()),
-            }),
+            Err(e) => {
+                tracing::error!("Sync failed after {}ms: {}", duration_ms, e);
+                Err(Error::Sync(e.to_string()))
+            }
         }
     }
 

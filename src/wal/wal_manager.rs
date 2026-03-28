@@ -27,6 +27,9 @@ pub struct WalConfig {
     pub batch_size: usize,
     /// 预读缓冲区大小
     pub read_ahead_size: usize,
+    /// 周期同步间隔（毫秒），仅在 SyncMode::Periodic 时使用
+    /// 设置后会自动启动后台任务执行定期同步
+    pub periodic_sync_interval_ms: Option<u64>,
 }
 
 impl Default for WalConfig {
@@ -37,6 +40,7 @@ impl Default for WalConfig {
             sync_mode: SyncMode::None,
             batch_size: 100,
             read_ahead_size: 64 * 1024, // 64KB
+            periodic_sync_interval_ms: None,
         }
     }
 }
@@ -77,6 +81,16 @@ impl WalConfig {
         self.read_ahead_size = size;
         self
     }
+
+    /// 设置周期同步间隔（毫秒）
+    ///
+    /// 设置后会自动启动后台任务执行定期同步。
+    /// 这是一个便捷方法，会同时设置 `sync_mode` 为 `Periodic`。
+    pub fn with_periodic_sync_interval(mut self, interval_ms: u64) -> Self {
+        self.periodic_sync_interval_ms = Some(interval_ms);
+        self.sync_mode = SyncMode::Periodic { interval_ms };
+        self
+    }
 }
 
 /// WAL 记录
@@ -96,6 +110,10 @@ pub struct WalManager {
     read_coordinator: Arc<ReadCoordinator>,
     recovery_manager: RecoveryManager,
     config: WalConfig,
+    /// 用于取消后台任务的句柄
+    periodic_sync_handle: Option<tokio::task::JoinHandle<()>>,
+    /// 优雅关闭信号
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 impl WalManager {
@@ -126,11 +144,45 @@ impl WalManager {
         // 创建恢复管理器
         let recovery_manager = RecoveryManager::new(&config.dir);
 
+        // 如果配置了周期同步，启动后台任务
+        let (shutdown_tx, periodic_sync_handle) =
+            if let Some(interval_ms) = config.periodic_sync_interval_ms {
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                let coordinator = write_coordinator.clone();
+
+                let handle = tokio::spawn(async move {
+                    let interval = tokio::time::Duration::from_millis(interval_ms);
+                    let mut rx = rx;
+
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(interval) => {
+                                if let Err(e) = coordinator.check_periodic_sync().await {
+                                    tracing::warn!("Periodic sync failed: {}", e);
+                                }
+                            }
+                            _ = rx.changed() => {
+                                if *rx.borrow() {
+                                    tracing::debug!("Periodic sync task received shutdown signal");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+
+                (Some(tx), Some(handle))
+            } else {
+                (None, None)
+            };
+
         Ok(Self {
             write_coordinator,
             read_coordinator,
             recovery_manager,
             config,
+            periodic_sync_handle,
+            shutdown_tx,
         })
     }
 
@@ -240,6 +292,13 @@ impl WalManager {
 
     /// 关闭 WAL
     pub async fn close(&self) -> Result<()> {
+        // 停止后台定时同步任务
+        if let Some(ref tx) = self.shutdown_tx {
+            let _ = tx.send(true);
+        }
+        // 注意：不等待任务完成，让它自然结束
+        // 这可能导致少量数据未同步，但保证了 close 不会阻塞
+
         self.write_coordinator.close().await?;
         self.read_coordinator.close().await
     }
@@ -319,6 +378,11 @@ impl WalBuilder {
 
     pub fn with_read_ahead_size(mut self, size: usize) -> Self {
         self.config.read_ahead_size = size;
+        self
+    }
+
+    pub fn with_periodic_sync_interval(mut self, interval_ms: u64) -> Self {
+        self.config = self.config.with_periodic_sync_interval(interval_ms);
         self
     }
 
@@ -430,6 +494,39 @@ mod tests {
 
         let segments = wal.segments().await;
         assert!(segments.len() >= 1);
+
+        wal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wal_periodic_sync_builtin() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp_dir = tempdir().unwrap();
+        let sync_called = Arc::new(AtomicBool::new(false));
+        let sync_called_clone = sync_called.clone();
+
+        // 使用内置周期同步，间隔 50ms
+        let wal = WalBuilder::new()
+            .with_dir(temp_dir.path())
+            .with_periodic_sync_interval(50)
+            .build()
+            .await
+            .unwrap();
+
+        // 写入一些数据
+        wal.write(b"test data").await.unwrap();
+
+        // 等待足够长让定时器触发多次
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // 检查同步统计
+        let stats = wal.sync_stats().await;
+        assert!(
+            stats.sync_count > 0,
+            "Periodic sync should have been called"
+        );
 
         wal.close().await.unwrap();
     }
