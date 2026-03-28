@@ -2,6 +2,13 @@
 
 ## 待完成
 
+- [ ] 多读多写扩展 (RocksDB-style Group Commit)
+  - 设计文档: `docs/multi-writer/DESIGN.md`
+  - 实现 Phase 1: CommitCoordinator + WriteBatch
+  - 实现 Phase 2: MultiWriterCoordinator
+  - 实现 Phase 3: WalBuilder 集成
+  - 实现 Phase 4: 优化 (lock-free batch builder)
+
 - [ ] 性能基准测试（目标：10万+ QPS）
   - 创建 `benches/bench.rs`
   - 启用 Cargo.toml bench 配置
