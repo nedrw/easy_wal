@@ -7,11 +7,13 @@
 
 mod coordinators;
 mod recovery;
+mod segment_coordinator;
 mod sync_strategy;
 mod wal_manager;
 
 pub use coordinators::{ReadCoordinator, WriteCoordinator};
 pub use recovery::{Checkpoint, CheckpointPosition, RecoveryManager, RecoveryMode, RecoveryResult};
+pub use segment_coordinator::{ExtendedSegmentStats, RotationConfig, SegmentCoordinator};
 pub use sync_strategy::{SyncContext, SyncMode, SyncStats, SyncStrategy};
 pub use wal_manager::{Record, WalBuilder, WalConfig, WalManager};
 

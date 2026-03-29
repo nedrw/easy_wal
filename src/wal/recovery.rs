@@ -416,7 +416,7 @@ impl RecoveryManager {
 
     /// 获取段文件路径
     fn segment_path(&self, segment_id: u64) -> PathBuf {
-        self.dir.join(format!("{:020}.seg", segment_id))
+        self.dir.join(format!("segment{}.wal", segment_id))
     }
 
     /// 在指定位置之后查找下一个记录魔术
@@ -474,9 +474,15 @@ impl RecoveryManager {
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
 
-            if name.ends_with(".seg") {
-                if let Ok(id) = name.trim_end_matches(".seg").parse::<u64>() {
-                    segment_ids.push(id);
+            // 匹配 SegmentManager 创建的文件名格式：segment{ID}.wal
+            if name.starts_with("segment") && name.ends_with(".wal") {
+                let id_str = name
+                    .strip_prefix("segment")
+                    .and_then(|s| s.strip_suffix(".wal"));
+                if let Some(id_str) = id_str {
+                    if let Ok(id) = id_str.parse::<u64>() {
+                        segment_ids.push(id);
+                    }
                 }
             }
         }

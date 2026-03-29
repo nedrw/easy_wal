@@ -223,11 +223,6 @@ impl SegmentManager {
         self.active_size
     }
 
-    /// 检查是否需要轮转
-    pub fn should_rotate(&self) -> bool {
-        self.active_size >= self.config.max_segment_size
-    }
-
     /// 生成段文件路径
     fn make_path(&self, id: u64) -> PathBuf {
         let file_name = format!("{}{}.{}", self.config.prefix, id, self.config.extension);
@@ -267,24 +262,13 @@ impl SegmentManager {
 
     /// 更新活跃段大小
     ///
-    /// 在写入数据后调用，检查是否需要轮转
-    pub fn update_active_size(&mut self, written: u64) -> bool {
+    /// 在写入数据后调用，只更新大小，不决策轮转
+    pub fn update_active_size(&mut self, written: u64) {
         self.active_size += written;
 
-        // 如果达到大小上限，需要轮转
-        if self.should_rotate() {
-            // 标记当前段为非活跃
-            if let Some(segment) = self.segments.iter_mut().find(|s| s.id == self.active_id) {
-                segment.is_active = false;
-                segment.size = self.active_size;
-            }
-            true
-        } else {
-            // 更新大小
-            if let Some(segment) = self.segments.iter_mut().find(|s| s.id == self.active_id) {
-                segment.size = self.active_size;
-            }
-            false
+        // 更新当前活跃段的元数据
+        if let Some(segment) = self.segments.iter_mut().find(|s| s.id == self.active_id) {
+            segment.size = self.active_size;
         }
     }
 
@@ -412,11 +396,7 @@ mod tests {
         // 初始活跃段
         assert_eq!(manager.active_id(), 0);
 
-        // 更新大小触发轮转
-        let should_rotate = manager.update_active_size(100);
-        assert!(should_rotate);
-
-        // 轮转后创建新段
+        // 创建第一个段
         let (id, _path) = manager.rotate().unwrap();
         assert_eq!(id, 1);
     }
@@ -428,14 +408,12 @@ mod tests {
 
         let mut manager = SegmentManager::new(config).unwrap();
 
-        // 未达到上限
-        let should_rotate = manager.update_active_size(50);
-        assert!(!should_rotate);
+        // 更新大小
+        manager.update_active_size(50);
         assert_eq!(manager.active_size(), 50);
 
-        // 达到上限
-        let should_rotate = manager.update_active_size(50);
-        assert!(should_rotate);
+        // 继续更新
+        manager.update_active_size(50);
         assert_eq!(manager.active_size(), 100);
     }
 

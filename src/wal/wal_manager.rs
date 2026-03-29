@@ -7,10 +7,10 @@
 
 use super::{
     Checkpoint, CheckpointPosition, ReadCoordinator, RecoveryManager, RecoveryMode, RecoveryResult,
-    SyncMode, WriteCoordinator,
+    RotationConfig, SegmentCoordinator, SyncMode, WriteCoordinator,
 };
 use crate::prelude::*;
-use crate::storage::{LogReader, LogReaderConfig, LogWriter, LogWriterConfig, WritePosition};
+use crate::storage::{LogReader, LogReaderConfig, SegmentConfig, WritePosition};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -96,13 +96,17 @@ impl WalManager {
         // 创建目录
         tokio::fs::create_dir_all(&config.dir).await?;
 
-        // 创建写入器
-        let writer_config = LogWriterConfig::default()
-            .with_dir(&config.dir)
-            .with_max_segment_size(config.max_segment_size);
-        let writer = Arc::new(LogWriter::new(writer_config).await?);
+        // 创建段协调器（新增）
+        let rotation_config = RotationConfig::new().with_max_size(config.max_segment_size);
+        let segment_config = SegmentConfig::new(&config.dir);
+        let segment_coordinator =
+            Arc::new(SegmentCoordinator::new(rotation_config, segment_config).await?);
 
-        // 创建读取器
+        // 创建写入协调器（改造：使用 SegmentCoordinator）
+        let write_coordinator =
+            Arc::new(WriteCoordinator::new(segment_coordinator, config.sync_mode));
+
+        // 创建读取器（不变）
         let reader_config = LogReaderConfig::default()
             .with_dir(&config.dir)
             .with_batch_size(config.batch_size);
@@ -110,12 +114,11 @@ impl WalManager {
             LogReader::new(reader_config).await?,
         ));
 
-        // 创建协调器
-        let write_coordinator = Arc::new(WriteCoordinator::new(writer, config.sync_mode));
+        // 创建读取协调器（不变）
         let read_coordinator =
             Arc::new(ReadCoordinator::new(reader).with_read_ahead(config.read_ahead_size));
 
-        // 创建恢复管理器
+        // 创建恢复管理器（不变）
         let recovery_manager = RecoveryManager::new(&config.dir);
 
         // 如果配置了周期同步，启动后台任务

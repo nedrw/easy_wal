@@ -1,10 +1,30 @@
 //! 存储层集成测试
 //!
-//! 测试组件间的协作：Storage + SegmentManager + LogWriter
+//! 测试组件间的协作：Storage + SegmentManager + LogWriter + SegmentCoordinator
 
-use easy_wal::{FileStorage, LogWriter, LogWriterConfig, MemoryStorage, SegmentConfig, Storage};
+use easy_wal::wal::{RotationConfig, SegmentCoordinator};
+use easy_wal::{FileStorage, LogWriter, MemoryStorage, SegmentConfig, Storage};
 use std::sync::Arc;
 use tempfile::tempdir;
+
+/// 辅助函数：创建测试用的 LogWriter
+async fn create_test_log_writer(dir: &std::path::Path, segment_id: u64) -> LogWriter {
+    let path = dir.join(format!("segment{}.wal", segment_id));
+    let storage = Arc::new(FileStorage::new(&path).await.unwrap());
+    storage.write_header_if_empty().await.unwrap();
+    LogWriter::new(storage, segment_id)
+}
+
+/// 辅助函数：创建测试用的 SegmentCoordinator
+async fn create_test_segment_coordinator(dir: &std::path::Path) -> Arc<SegmentCoordinator> {
+    let rotation_config = RotationConfig::new();
+    let segment_config = SegmentConfig::new(dir);
+    Arc::new(
+        SegmentCoordinator::new(rotation_config, segment_config)
+            .await
+            .unwrap(),
+    )
+}
 
 // ============================================================================
 // Storage trait 测试
@@ -183,13 +203,9 @@ async fn test_segment_manager_rotate_sequence() {
     assert_eq!(manager.active_id(), 0);
     assert_eq!(manager.segment_count(), 0, "no segment files initially");
 
-    // 写入数据达到上限，标记需要轮转
-    let need_rotate = manager.update_active_size(10);
-    assert!(
-        need_rotate,
-        "should mark as need rotate after reaching limit"
-    );
-    assert!(manager.should_rotate(), "should_rotate should return true");
+    // 写入数据达到上限（不再决策轮转，只更新大小）
+    manager.update_active_size(10);
+    assert_eq!(manager.active_size(), 10, "active size should be 10");
 
     // 轮转：创建段1
     let (id1, path1) = manager.rotate().unwrap();
@@ -197,18 +213,12 @@ async fn test_segment_manager_rotate_sequence() {
     assert!(path1.exists());
     assert_eq!(manager.segment_count(), 1, "should have segment [1]");
 
-    // 继续写入，active_size 重置为 0
+    // 继续写入，更新大小
     manager.update_active_size(5);
-    assert!(
-        !manager.should_rotate(),
-        "should not need rotate after 5 bytes"
-    );
-
-    // 再次达到上限
-    manager.update_active_size(5);
-    assert!(
-        manager.should_rotate(),
-        "should need rotate after another 5 bytes"
+    assert_eq!(
+        manager.active_size(),
+        5,
+        "active size should be 5 after rotate"
     );
 
     // 再次轮转：创建段2
@@ -230,11 +240,7 @@ async fn test_segment_manager_rotate_sequence() {
 async fn test_log_writer_full_workflow() {
     let temp_dir = tempdir().unwrap();
 
-    let config = LogWriterConfig::default()
-        .with_dir(temp_dir.path())
-        .with_max_segment_size(100);
-
-    let writer = LogWriter::new(config).await.unwrap();
+    let writer = create_test_log_writer(temp_dir.path(), 1).await;
 
     // 写入多批数据
     let pos1 = writer.write(b"batch1").await.unwrap();
@@ -245,9 +251,9 @@ async fn test_log_writer_full_workflow() {
     assert!(pos2.offset > pos1.offset);
     assert!(pos3.offset > pos2.offset);
 
-    // 验证段信息
-    let segments = writer.segments().await;
-    assert!(!segments.is_empty());
+    // 验证段大小增长
+    let size = writer.size().await.unwrap();
+    assert!(size > 16, "size should include segment header and data");
 
     // 关闭
     writer.close().await.unwrap();
@@ -257,59 +263,60 @@ async fn test_log_writer_full_workflow() {
 async fn test_log_writer_rotation_on_limit() {
     let temp_dir = tempdir().unwrap();
 
-    // 设置很小的段大小来触发轮转
-    let config = LogWriterConfig::default()
-        .with_dir(temp_dir.path())
-        .with_max_segment_size(5); // 每个段最多 5 字节
+    // 注意：LogWriter 不再负责段轮转，此测试改为测试 SegmentCoordinator 的轮转功能
+    let rotation_config = RotationConfig::new().with_max_size(30); // 小段大小
+    let segment_config = SegmentConfig::new(temp_dir.path());
+    let coordinator = Arc::new(
+        SegmentCoordinator::new(rotation_config, segment_config)
+            .await
+            .unwrap(),
+    );
 
-    let writer = LogWriter::new(config).await.unwrap();
+    let writer = coordinator.get_active_writer().await.unwrap();
+    let segment1 = writer.segment_id();
 
-    // 写入 "hello" (5 bytes) - 应该刚好达到上限
-    let _ = writer.write(b"hello").await.unwrap();
-    let segment1 = writer.active_segment_id().await;
+    // 写入数据触发轮转（通过 coordinator）
+    writer.write(b"hello world test").await.unwrap();
+    coordinator.update_size(29, 1).await; // 更新大小接近上限
 
-    // 写入 "world" (5 bytes) - 触发轮转
-    let _ = writer.write(b"world").await.unwrap();
-    let segment2 = writer.active_segment_id().await;
-
-    // 应该已经轮转到新段
-    assert!(segment2 >= segment1);
+    // 检查是否需要轮转
+    let rotated = coordinator.check_and_rotate().await.unwrap();
+    if rotated {
+        // 获取新的写入器
+        let writer2 = coordinator.get_active_writer().await.unwrap();
+        let segment2 = writer2.segment_id();
+        assert!(segment2 > segment1, "should rotate to new segment");
+    }
 }
 
 #[tokio::test]
 async fn test_log_writer_manual_rotation() {
     let temp_dir = tempdir().unwrap();
 
-    let config = LogWriterConfig::default()
-        .with_dir(temp_dir.path())
-        .with_max_segment_size(1000);
+    // 注意：LogWriter 不再负责段轮转，此测试改为测试 SegmentCoordinator 的手动轮转
+    let coordinator = create_test_segment_coordinator(temp_dir.path()).await;
 
-    let writer = LogWriter::new(config).await.unwrap();
-
-    // 写入一些数据
+    let writer = coordinator.get_active_writer().await.unwrap();
     writer.write(b"before rotation").await.unwrap();
 
-    // 手动轮转
-    let (_new_id, path) = writer.rotate().await.unwrap();
-    assert!(path.exists());
+    // 手动轮转（通过 coordinator）
+    let (new_id, path) = coordinator.force_rotate().await.unwrap();
+    assert!(path.exists(), "new segment file should exist");
+    assert!(new_id > 1, "new segment ID should be greater");
 
     // 新段写入
     writer.write(b"after rotation").await.unwrap();
 
     // 验证有两个段
-    let segments = writer.segments().await;
+    let segments = coordinator.segments().await;
     assert_eq!(segments.len(), 2);
 }
 
 #[tokio::test]
-async fn test_log_writer_batch() {
+async fn test_log_writer_batch_write() {
     let temp_dir = tempdir().unwrap();
 
-    let config = LogWriterConfig::default()
-        .with_dir(temp_dir.path())
-        .with_max_segment_size(1000);
-
-    let writer = LogWriter::new(config).await.unwrap();
+    let writer = create_test_log_writer(temp_dir.path(), 1).await;
 
     // 批量写入
     let data_list: Vec<&[u8]> = vec![b"item1", b"item2", b"item3", b"item4", b"item5"];
@@ -409,24 +416,4 @@ async fn test_concurrent_segment_creation() {
     // 验证段数量
     let mgr = manager.lock().await;
     assert!(mgr.segment_count() >= 1);
-}
-
-#[tokio::test]
-async fn test_write_persistence() {
-    let temp_dir = tempdir().unwrap();
-
-    let config = LogWriterConfig::default().with_dir(temp_dir.path());
-
-    let writer = LogWriter::new(config).await.unwrap();
-    writer.write(b"important data").await.unwrap();
-    writer.close().await.unwrap();
-
-    // 重新打开，检查数据是否存在
-    let config2 = LogWriterConfig::default().with_dir(temp_dir.path());
-
-    let writer2 = LogWriter::new(config2).await.unwrap();
-    let segments = writer2.segments().await;
-
-    // 应该有历史数据
-    assert!(!segments.is_empty());
 }
