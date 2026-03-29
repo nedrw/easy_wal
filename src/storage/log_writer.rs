@@ -5,11 +5,10 @@
 //! - 学习状态管理
 //! - 学习资源池化
 
-use super::{FileStorage, SegmentConfig, SegmentManager, Storage, crc32, format};
+use super::{FileStorage, SegmentConfig, Storage, crc32, format};
 use crate::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// 日志写入器配置
 #[derive(Debug, Clone)]
@@ -52,134 +51,80 @@ pub struct WritePosition {
     pub length: u64,
 }
 
-/// 日志写入器
+/// 日志写入器（轻量级版本）
 ///
-/// 封装段管理和存储操作，提供统一的写入接口。
-/// 同步策略由 WriteCoordinator 负责，本组件只执行写入和同步操作。
+/// 只负责纯粹的数据写入，不管理段生命周期。
+/// 段轮转策略由上层的 SegmentCoordinator 负责。
 pub struct LogWriter {
-    #[allow(dead_code)]
-    config: LogWriterConfig,
-    segment_manager: RwLock<SegmentManager>,
-    active_storage: RwLock<Option<Arc<FileStorage>>>,
+    /// 存储层
+    storage: Arc<FileStorage>,
+    /// 段 ID
+    segment_id: u64,
 }
 
 impl LogWriter {
     /// 创建日志写入器
-    pub async fn new(config: LogWriterConfig) -> Result<Self> {
-        let segment_manager = SegmentManager::new(config.segment_config.clone())
-            .map_err(|e| Error::Generic(format!("Failed to create segment manager: {}", e)))?;
-
-        Ok(Self {
-            config,
-            segment_manager: RwLock::new(segment_manager),
-            active_storage: RwLock::new(None),
-        })
+    ///
+    /// 接受外部提供的存储和段 ID，不负责段管理。
+    pub fn new(storage: Arc<FileStorage>, segment_id: u64) -> Self {
+        Self {
+            storage,
+            segment_id,
+        }
     }
 
-    /// 获取或创建活跃段的存储
-    async fn get_active_storage(&self) -> Result<Arc<FileStorage>> {
-        // 先尝试获取现有存储
-        {
-            let storage = self.active_storage.read().await;
-            if let Some(ref s) = *storage {
-                return Ok(s.clone());
-            }
-        }
+    /// 获取存储引用
+    pub fn storage(&self) -> &FileStorage {
+        &self.storage
+    }
 
-        // 需要创建新存储
-        let mut manager = self.segment_manager.write().await;
-
-        // 如果没有活跃段，创建第一个
-        if manager.active_id() == 0 {
-            manager
-                .create_segment()
-                .map_err(|e| Error::Generic(format!("Failed to create first segment: {}", e)))?;
-        }
-
-        let path = manager.active_path();
-        let storage = Arc::new(
-            FileStorage::new(&path)
-                .await
-                .map_err(|e| Error::Generic(format!("Failed to create storage: {}", e)))?,
-        );
-
-        // 写入段文件头
-        storage.write_header_if_empty().await?;
-
-        // 保存到活跃存储
-        let mut active = self.active_storage.write().await;
-        *active = Some(storage.clone());
-
-        Ok(storage)
+    /// 获取段 ID
+    pub fn segment_id(&self) -> u64 {
+        self.segment_id
     }
 
     /// 写入数据（带长度前缀和CRC32）
     ///
     /// 格式：[4字节 magic][4字节长度][4字节CRC32][数据...]
     ///
-    /// 根据同步策略决定是否执行 fsync：
-    /// - FsyncOnWrite: 每次写入后自动同步
-    /// - Batch: 累积到指定数量后同步
-    /// - Periodic: 需要外部定时任务触发
-    /// - None: 不同步，依赖操作系统缓冲区
+    /// 注意：本方法只负责纯粹的数据写入，不决策段轮转。
+    /// 段轮转策略由上层的 SegmentCoordinator 负责。
     ///
     /// # 返回
     /// 返回写入位置信息（offset 为数据开始位置，不含记录头）
     pub async fn write(&self, data: &[u8]) -> Result<WritePosition> {
-        // 获取活跃存储
-        let storage = self.get_active_storage().await?;
-
-        // 获取段信息
-        let segment_id = {
-            let manager = self.segment_manager.read().await;
-            manager.active_id()
-        };
-
         // 计算数据CRC32
         let data_crc = crc32(data);
 
-        // 写入记录头 (12 bytes): [4B magic][4B length][4B crc]
+        // 准备记录头 (12 bytes): [4B magic][4B length][4B crc]
         let magic_bytes = format::RECORD_MAGIC.to_be_bytes();
         let length_bytes = (data.len() as u32).to_be_bytes();
         let crc_bytes = data_crc.to_be_bytes();
 
-        let _offset = storage.append(&magic_bytes).await?;
-        storage.append(&length_bytes).await?;
-        storage.append(&crc_bytes).await?;
+        // 原子批量写入：一次性写入整个记录（magic + length + crc + data）
+        // 保证并发安全：多个并发 write() 调用时，每个记录完整写入，不会交错
+        let data_list: Vec<&[u8]> = vec![&magic_bytes, &length_bytes, &crc_bytes, data];
+        let offsets = self.storage.append_batch(&data_list).await?;
 
-        // 写入数据
-        let data_offset = storage.append(data).await?;
-
-        // 计算总长度（含记录头）
-        let total_len = format::RECORD_HEADER_SIZE + data.len() as u64;
-
-        // 更新段大小，检查是否需要轮转
-        let should_rotate = {
-            let mut manager = self.segment_manager.write().await;
-            manager.update_active_size(total_len)
-        };
-
-        // 如果需要轮转，清除活跃存储，强制下次创建新段
-        if should_rotate {
-            let mut active = self.active_storage.write().await;
-            *active = None;
-        }
-
-        // 同步决策由 WriteCoordinator 负责，本组件只负责写入
+        // offsets[3] 是数据的起始位置
+        let data_offset = offsets[3];
 
         Ok(WritePosition {
-            segment_id,
+            segment_id: self.segment_id,
             offset: data_offset, // 返回数据开始位置（不含前缀）
             length: data.len() as u64,
         })
     }
 
-    /// 批量写入
+    /// 批量写入（简化版本，不支持跨段）
     ///
-    /// 使用 storage 层的原子批量追加接口，支持跨段写入。
+    /// 使用 storage 层的原子批量追加接口。
     /// 单条记录不可拆分跨段，多条记录可在段内批量追加（段内原子）。
-    /// 当批量数据超过段大小时，自动轮转到新段继续写入。
-    /// 根据同步策略决定是否执行 fsync。
+    ///
+    /// 注意：本方法假设当前段有足够空间容纳所有数据。
+    /// 如果空间不足，会返回错误。段轮转策略由上层的 SegmentCoordinator 负责。
+    ///
+    /// TODO: 未来版本可能需要支持跨段批量写入，但这需要更复杂的协调逻辑。
     pub async fn write_batch(&self, data_list: &[&[u8]]) -> Result<Vec<WritePosition>> {
         if data_list.is_empty() {
             return Ok(Vec::new());
@@ -204,119 +149,27 @@ impl LogWriter {
             })
             .collect();
 
-        let mut positions = Vec::with_capacity(data_list.len());
-        let mut record_index = 0;
+        // 批量追加到当前段（段内原子）
+        let batch_records: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+        let offsets = self.storage.append_batch(&batch_records).await?;
 
-        while record_index < records.len() {
-            // 获取当前活跃存储
-            let storage = self.get_active_storage().await?;
-
-            // 获取段配置
-            let (segment_id, max_segment_size) = {
-                let manager = self.segment_manager.read().await;
-                (manager.active_id(), manager.config().max_segment_size)
-            };
-
-            // 计算当前段剩余空间
-            let current_size = storage.size().await?;
-            let header_size = format::SEGMENT_HEADER_SIZE;
-            let remaining = if current_size < header_size {
-                max_segment_size.saturating_sub(header_size)
-            } else {
-                max_segment_size.saturating_sub(current_size - header_size)
-            };
-
-            // 找出当前段能容纳的记录（贪心填充）
-            let mut batch_records: Vec<&[u8]> = Vec::new();
-            let mut batch_size: u64 = 0;
-            let mut batch_indices: Vec<usize> = Vec::new();
-
-            while record_index < records.len() {
-                let record_len = records[record_index].len() as u64;
-                // 单条记录不能超过段最大大小（否则永远无法写入）
-                if record_len > max_segment_size - header_size {
-                    return Err(Error::Generic(format!(
-                        "Record size {} exceeds maximum segment capacity",
-                        record_len
-                    )));
-                }
-                // 检查是否能容纳下一条记录
-                if batch_size + record_len > remaining && !batch_records.is_empty() {
-                    break; // 当前段满了，停止填充
-                }
-                batch_records.push(records[record_index].as_slice());
-                batch_indices.push(record_index);
-                batch_size += record_len;
-                record_index += 1;
-            }
-
-            // 批量追加到当前段（段内原子）
-            let offsets = storage.append_batch(&batch_records).await?;
-
-            // 更新段大小
-            {
-                let mut manager = self.segment_manager.write().await;
-                manager.update_active_size(batch_size);
-            }
-
-            // 构建当前位置信息
-            for (i, &offset) in offsets.iter().enumerate() {
-                let data_idx = batch_indices[i];
-                positions.push(WritePosition {
-                    segment_id,
-                    offset: offset + format::RECORD_HEADER_SIZE,
-                    length: data_list[data_idx].len() as u64,
-                });
-            }
-
-            // 检查是否需要轮转到新段
-            let needs_rotate = {
-                let manager = self.segment_manager.read().await;
-                manager.should_rotate()
-            };
-
-            if needs_rotate {
-                // 轮转到新段
-                let mut manager = self.segment_manager.write().await;
-                manager
-                    .rotate()
-                    .map_err(|e| Error::Generic(format!("Failed to rotate: {}", e)))?;
-
-                // 清除活跃存储
-                let mut active = self.active_storage.write().await;
-                *active = None;
-            }
-        }
-
-        // 同步决策由 WriteCoordinator 负责，本组件只负责写入
+        // 构建位置信息
+        let positions: Vec<WritePosition> = offsets
+            .iter()
+            .enumerate()
+            .map(|(i, &offset)| WritePosition {
+                segment_id: self.segment_id,
+                offset: offset + format::RECORD_HEADER_SIZE,
+                length: data_list[i].len() as u64,
+            })
+            .collect();
 
         Ok(positions)
     }
 
-    /// 强制轮转到新段
-    pub async fn rotate(&self) -> Result<(u64, std::path::PathBuf)> {
-        let mut manager = self.segment_manager.write().await;
-        let (id, path) = manager
-            .rotate()
-            .map_err(|e| Error::Generic(format!("Failed to rotate: {}", e)))?;
-
-        // 清除活跃存储
-        let mut active = self.active_storage.write().await;
-        *active = None;
-
-        Ok((id, path))
-    }
-
-    /// 获取当前活跃段 ID
-    pub async fn active_segment_id(&self) -> u64 {
-        let manager = self.segment_manager.read().await;
-        manager.active_id()
-    }
-
-    /// 获取所有段信息
-    pub async fn segments(&self) -> Vec<super::SegmentMeta> {
-        let manager = self.segment_manager.read().await;
-        manager.segments().to_vec()
+    /// 获取当前段大小
+    pub async fn size(&self) -> Result<u64> {
+        self.storage.size().await
     }
 
     /// 同步所有未持久化的数据
@@ -324,11 +177,7 @@ impl LogWriter {
     /// 执行 fsync，确保数据持久化到磁盘。
     /// 同步决策由 WriteCoordinator 负责，本方法只执行实际的 fsync 操作。
     pub async fn sync(&self) -> Result<()> {
-        let storage = self.active_storage.read().await;
-        if let Some(ref s) = *storage {
-            s.sync().await?;
-        }
-        Ok(())
+        self.storage.sync().await
     }
 
     /// 关闭写入器
@@ -344,14 +193,18 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// 辅助函数：创建测试用的 LogWriter
+    async fn create_test_writer(dir: &std::path::Path, segment_id: u64) -> LogWriter {
+        let path = dir.join(format!("segment{}.wal", segment_id));
+        let storage = Arc::new(FileStorage::new(&path).await.unwrap());
+        storage.write_header_if_empty().await.unwrap();
+        LogWriter::new(storage, segment_id)
+    }
+
     #[tokio::test]
     async fn test_basic_write() {
         let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default()
-            .with_dir(temp_dir.path())
-            .with_max_segment_size(1000);
-
-        let writer = LogWriter::new(config).await.unwrap();
+        let writer = create_test_writer(temp_dir.path(), 1).await;
 
         // 写入数据
         let pos = writer.write(b"hello world").await.unwrap();
@@ -365,44 +218,27 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_writes() {
         let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default()
-            .with_dir(temp_dir.path())
-            .with_max_segment_size(1000);
-
-        let writer = LogWriter::new(config).await.unwrap();
+        let writer = create_test_writer(temp_dir.path(), 1).await;
 
         // 多次写入
-        writer.write(b"data1").await.unwrap();
-        writer.write(b"data2").await.unwrap();
-        writer.write(b"data3").await.unwrap();
+        let pos1 = writer.write(b"data1").await.unwrap();
+        let pos2 = writer.write(b"data2").await.unwrap();
+        let pos3 = writer.write(b"data3").await.unwrap();
 
-        let segments = writer.segments().await;
-        assert!(!segments.is_empty());
-    }
+        // 验证所有写入都在同一段
+        assert_eq!(pos1.segment_id, 1);
+        assert_eq!(pos2.segment_id, 1);
+        assert_eq!(pos3.segment_id, 1);
 
-    #[tokio::test]
-    async fn test_rotate_on_size_limit() {
-        let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default()
-            .with_dir(temp_dir.path())
-            .with_max_segment_size(10); // 小 size 便于触发轮转
-
-        let writer = LogWriter::new(config).await.unwrap();
-
-        // 写入超过限制的数据
-        writer.write(b"12345678901").await.unwrap(); // 11 bytes
-
-        // 应该已经轮转到新段
-        let id = writer.active_segment_id().await;
-        assert!(id >= 1);
+        // 验证段大小增长
+        let size = writer.size().await.unwrap();
+        assert!(size > 16); // 至少包含段头
     }
 
     #[tokio::test]
     async fn test_sync() {
         let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default().with_dir(temp_dir.path());
-
-        let writer = LogWriter::new(config).await.unwrap();
+        let writer = create_test_writer(temp_dir.path(), 1).await;
 
         writer.write(b"test data").await.unwrap();
         writer.sync().await.unwrap();
@@ -410,30 +246,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_manual_rotate() {
-        let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default()
-            .with_dir(temp_dir.path())
-            .with_max_segment_size(1000);
-
-        let writer = LogWriter::new(config).await.unwrap();
-
-        let id1 = writer.active_segment_id().await;
-
-        // 手动轮转
-        let (id2, _path) = writer.rotate().await.unwrap();
-
-        assert!(id2 > id1);
-    }
-
-    #[tokio::test]
     async fn test_batch_write() {
         let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default()
-            .with_dir(temp_dir.path())
-            .with_max_segment_size(10000);
-
-        let writer = LogWriter::new(config).await.unwrap();
+        let writer = create_test_writer(temp_dir.path(), 1).await;
 
         let data_list: Vec<&[u8]> = vec![b"a", b"bb", b"ccc"];
         let positions = writer.write_batch(&data_list).await.unwrap();
@@ -442,40 +257,30 @@ mod tests {
         assert_eq!(positions[0].length, 1);
         assert_eq!(positions[1].length, 2);
         assert_eq!(positions[2].length, 3);
+        assert_eq!(positions[0].segment_id, 1);
     }
 
     #[tokio::test]
-    async fn test_batch_write_cross_segment() {
+    async fn test_segment_id() {
         let temp_dir = tempdir().unwrap();
-        // 设置小段大小以便触发跨段
-        let config = LogWriterConfig::default()
-            .with_dir(temp_dir.path())
-            .with_max_segment_size(50); // 每个段最多50字节
+        let writer = create_test_writer(temp_dir.path(), 5).await;
 
-        let writer = LogWriter::new(config).await.unwrap();
+        // 验证段 ID 正确
+        assert_eq!(writer.segment_id(), 5);
+    }
 
-        // 准备数据：每条记录约20字节，3条约60字节，需要跨段
-        let data_list: Vec<&[u8]> = vec![
-            b"12345678901234", // 14 bytes data + 12 bytes header = 26 bytes
-            b"12345678901234", // 26 bytes
-            b"12345678901234", // 26 bytes (总计78字节，超过50字节段限制)
-        ];
+    #[tokio::test]
+    async fn test_size_tracking() {
+        let temp_dir = tempdir().unwrap();
+        let writer = create_test_writer(temp_dir.path(), 1).await;
 
-        let positions = writer.write_batch(&data_list).await.unwrap();
+        // 初始大小（只有段头）
+        let initial_size = writer.size().await.unwrap();
+        assert_eq!(initial_size, 16);
 
-        assert_eq!(positions.len(), 3);
-
-        // 验证产生了多个段
-        let segments = writer.segments().await;
-        assert!(
-            segments.len() >= 2,
-            "Expected at least 2 segments, got {}",
-            segments.len()
-        );
-
-        // 验证位置信息：前两条在同一段，第三条在新区段
-        assert_eq!(positions[0].segment_id, 1);
-        assert_eq!(positions[1].segment_id, 1);
-        assert_eq!(positions[2].segment_id, 2);
+        // 写入后大小增长
+        writer.write(b"test").await.unwrap();
+        let new_size = writer.size().await.unwrap();
+        assert_eq!(new_size, 16 + 12 + 4); // 段头 + 记录头 + 数据
     }
 }

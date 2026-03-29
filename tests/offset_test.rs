@@ -16,8 +16,6 @@ async fn test_write_vs_write_batch_offset() {
         .unwrap();
 
     let pos1 = wal1.write(b"hello").await.unwrap();
-    println!("write offset: {}", pos1.offset);
-    println!("write length: {}", pos1.length);
 
     wal1.close().await.unwrap();
 
@@ -30,8 +28,6 @@ async fn test_write_vs_write_batch_offset() {
         .unwrap();
 
     let positions = wal2.write_batch(&[b"hello"]).await.unwrap();
-    println!("write_batch offset: {}", positions[0].offset);
-    println!("write_batch length: {}", positions[0].length);
 
     wal2.close().await.unwrap();
 

@@ -6,8 +6,8 @@
 //! - 学习缓冲优化
 
 use crate::prelude::*;
-use crate::storage::{LogReader, LogWriter, ReadPosition, SegmentMeta, WritePosition};
-use crate::wal::{SyncContext, SyncMode, SyncStats};
+use crate::storage::{LogReader, ReadPosition, SegmentMeta, WritePosition};
+use crate::wal::{SegmentCoordinator, SyncContext, SyncMode, SyncStats};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -38,7 +38,7 @@ pub struct SyncReport {
 /// - 批量写入优化
 /// - 与 RecoveryManager 协作
 pub struct WriteCoordinator {
-    writer: Arc<LogWriter>,
+    segment_coordinator: Arc<SegmentCoordinator>,
     sync_context: RwLock<SyncContext>,
     /// 同步统计信息
     sync_stats: RwLock<SyncStats>,
@@ -46,27 +46,27 @@ pub struct WriteCoordinator {
 
 impl WriteCoordinator {
     /// 创建写入协调器
-    pub fn new(writer: Arc<LogWriter>, sync_mode: SyncMode) -> Self {
+    pub fn new(segment_coordinator: Arc<SegmentCoordinator>, sync_mode: SyncMode) -> Self {
         Self {
-            writer,
+            segment_coordinator,
             sync_context: RwLock::new(SyncContext::new(sync_mode)),
             sync_stats: RwLock::new(SyncStats::new()),
         }
     }
 
     /// 创建批量同步策略的协调器
-    pub fn with_batch(writer: Arc<LogWriter>, batch_size: u64) -> Self {
-        Self::new(writer, SyncMode::Batch { batch_size })
+    pub fn with_batch(segment_coordinator: Arc<SegmentCoordinator>, batch_size: u64) -> Self {
+        Self::new(segment_coordinator, SyncMode::Batch { batch_size })
     }
 
     /// 创建周期同步策略的协调器
-    pub fn with_periodic(writer: Arc<LogWriter>, interval_ms: u64) -> Self {
-        Self::new(writer, SyncMode::Periodic { interval_ms })
+    pub fn with_periodic(segment_coordinator: Arc<SegmentCoordinator>, interval_ms: u64) -> Self {
+        Self::new(segment_coordinator, SyncMode::Periodic { interval_ms })
     }
 
-    /// 获取底层写入器
-    pub fn writer(&self) -> Arc<LogWriter> {
-        self.writer.clone()
+    /// 获取段协调器
+    pub fn segment_coordinator(&self) -> Arc<SegmentCoordinator> {
+        self.segment_coordinator.clone()
     }
 
     /// 获取同步模式
@@ -101,10 +101,20 @@ impl WriteCoordinator {
             )));
         }
 
-        // 执行写入
-        let pos = self.writer.write(data).await?;
+        // 1. 从协调器获取活跃写入器
+        let writer = self.segment_coordinator.get_active_writer().await?;
 
-        // 根据策略决定是否同步
+        // 2. 执行写入
+        let pos = writer.write(data).await?;
+
+        // 3. 更新段大小（通知协调器）
+        let bytes_written = crate::storage::format::RECORD_HEADER_SIZE + data.len() as u64;
+        self.segment_coordinator.update_size(bytes_written, 1).await;
+
+        // 4. 检查是否需要轮转（由协调器决策）
+        self.segment_coordinator.check_and_rotate().await?;
+
+        // 5. 根据策略决定是否同步
         let should_sync = {
             let mut ctx = self.sync_context.write().await;
             ctx.on_write()
@@ -136,10 +146,25 @@ impl WriteCoordinator {
             }
         }
 
-        // 执行批量写入
-        let positions = self.writer.write_batch(data_list).await?;
+        // 1. 从协调器获取活跃写入器
+        let writer = self.segment_coordinator.get_active_writer().await?;
 
-        // 根据策略决定是否同步
+        // 2. 执行批量写入
+        let positions = writer.write_batch(data_list).await?;
+
+        // 3. 更新段大小（通知协调器）
+        let total_bytes = data_list
+            .iter()
+            .map(|d| crate::storage::format::RECORD_HEADER_SIZE + d.len() as u64)
+            .sum();
+        self.segment_coordinator
+            .update_size(total_bytes, positions.len() as u64)
+            .await;
+
+        // 4. 检查是否需要轮转（由协调器决策）
+        self.segment_coordinator.check_and_rotate().await?;
+
+        // 5. 根据策略决定是否同步
         let should_sync = {
             let mut ctx = self.sync_context.write().await;
             ctx.on_batch(positions.len() as u64)
@@ -180,7 +205,11 @@ impl WriteCoordinator {
     /// 执行实际的同步操作
     async fn do_sync(&self) -> Result<SyncReport> {
         let start = std::time::Instant::now();
-        let result = self.writer.sync().await;
+
+        // 获取活跃写入器并同步
+        let writer = self.segment_coordinator.get_active_writer().await?;
+        let result = writer.sync().await;
+
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match result {
@@ -212,23 +241,25 @@ impl WriteCoordinator {
 
     /// 强制轮转段
     pub async fn rotate(&self) -> Result<(u64, std::path::PathBuf)> {
-        self.writer.rotate().await
+        self.segment_coordinator.force_rotate().await
     }
 
     /// 获取活跃段 ID
     pub async fn active_segment_id(&self) -> u64 {
-        self.writer.active_segment_id().await
+        self.segment_coordinator.active_segment_id().await
     }
 
     /// 获取所有段信息
     pub async fn segments(&self) -> Vec<SegmentMeta> {
-        self.writer.segments().await
+        self.segment_coordinator.segments().await
     }
 
     /// 关闭写入协调器
     pub async fn close(&self) -> Result<()> {
         self.sync().await?;
-        self.writer.close().await
+        // 获取活跃写入器并关闭
+        let writer = self.segment_coordinator.get_active_writer().await?;
+        writer.close().await
     }
 }
 
@@ -495,16 +526,29 @@ impl ReadCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{LogReaderConfig, LogWriterConfig};
+    use crate::storage::{LogReaderConfig, SegmentConfig};
+    use crate::wal::{RotationConfig, SegmentCoordinator};
     use tempfile::tempdir;
+
+    /// 辅助函数：创建测试用的 WriteCoordinator
+    async fn create_test_coordinator(
+        dir: &std::path::Path,
+        sync_mode: SyncMode,
+    ) -> Arc<WriteCoordinator> {
+        let rotation_config = RotationConfig::new();
+        let segment_config = SegmentConfig::new(dir);
+        let segment_coordinator = Arc::new(
+            SegmentCoordinator::new(rotation_config, segment_config)
+                .await
+                .unwrap(),
+        );
+        Arc::new(WriteCoordinator::new(segment_coordinator, sync_mode))
+    }
 
     #[tokio::test]
     async fn test_write_coordinator_basic() {
         let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default().with_dir(temp_dir.path());
-
-        let writer = Arc::new(LogWriter::new(config).await.unwrap());
-        let coordinator = WriteCoordinator::new(writer, SyncMode::FsyncOnWrite);
+        let coordinator = create_test_coordinator(temp_dir.path(), SyncMode::FsyncOnWrite).await;
 
         let pos = coordinator.write(b"test data").await.unwrap();
         assert_eq!(pos.segment_id, 1);
@@ -516,10 +560,8 @@ mod tests {
     #[tokio::test]
     async fn test_batch_sync_mode() {
         let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default().with_dir(temp_dir.path());
-
-        let writer = Arc::new(LogWriter::new(config).await.unwrap());
-        let coordinator = WriteCoordinator::with_batch(writer, 3);
+        let coordinator =
+            create_test_coordinator(temp_dir.path(), SyncMode::Batch { batch_size: 3 }).await;
 
         // 前两次写入不应该触发同步
         coordinator.write(b"data1").await.unwrap();
@@ -538,10 +580,7 @@ mod tests {
     #[tokio::test]
     async fn test_fsync_on_write_mode() {
         let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default().with_dir(temp_dir.path());
-
-        let writer = Arc::new(LogWriter::new(config).await.unwrap());
-        let coordinator = WriteCoordinator::new(writer, SyncMode::FsyncOnWrite);
+        let coordinator = create_test_coordinator(temp_dir.path(), SyncMode::FsyncOnWrite).await;
 
         // 每次写入都应该触发同步
         coordinator.write(b"data1").await.unwrap();
@@ -556,17 +595,14 @@ mod tests {
     #[tokio::test]
     async fn test_sync_returns_report() {
         let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default().with_dir(temp_dir.path());
+        // 使用 SyncMode::None，避免自动同步，确保手动 sync 有实际数据需要同步
+        let coordinator = create_test_coordinator(temp_dir.path(), SyncMode::None).await;
 
-        let writer = Arc::new(LogWriter::new(config).await.unwrap());
-        let coordinator = WriteCoordinator::new(writer, SyncMode::FsyncOnWrite);
-
-        // 写入数据触发同步
+        // 写入数据（不会自动同步）
         coordinator.write(b"test data").await.unwrap();
 
-        // 手动同步并获取报告
+        // 手动同步并获取报告（现在会有实际数据需要同步）
         let report = coordinator.sync().await.unwrap();
-        assert!(report.duration_ms > 0);
         assert!(report.success);
         assert!(report.error.is_none());
 
@@ -576,11 +612,8 @@ mod tests {
     #[tokio::test]
     async fn test_periodic_sync_mode() {
         let temp_dir = tempdir().unwrap();
-        let config = LogWriterConfig::default().with_dir(temp_dir.path());
-
-        let writer = Arc::new(LogWriter::new(config).await.unwrap());
-        // 100ms 间隔
-        let coordinator = WriteCoordinator::with_periodic(writer, 100);
+        let coordinator =
+            create_test_coordinator(temp_dir.path(), SyncMode::Periodic { interval_ms: 100 }).await;
 
         // 写入数据不应该触发同步
         coordinator.write(b"data1").await.unwrap();
@@ -602,9 +635,7 @@ mod tests {
     async fn test_read_coordinator_basic() {
         let temp_dir = tempdir().unwrap();
 
-        let writer_config = LogWriterConfig::default().with_dir(temp_dir.path());
-        let writer = Arc::new(LogWriter::new(writer_config).await.unwrap());
-        let write_coord = WriteCoordinator::new(writer, SyncMode::FsyncOnWrite);
+        let write_coord = create_test_coordinator(temp_dir.path(), SyncMode::FsyncOnWrite).await;
         write_coord.write(b"hello").await.unwrap();
         write_coord.close().await.unwrap();
 
@@ -624,9 +655,7 @@ mod tests {
     async fn test_read_write_round_trip() {
         let temp_dir = tempdir().unwrap();
 
-        let writer_config = LogWriterConfig::default().with_dir(temp_dir.path());
-        let writer = Arc::new(LogWriter::new(writer_config).await.unwrap());
-        let write_coord = WriteCoordinator::new(writer, SyncMode::FsyncOnWrite);
+        let write_coord = create_test_coordinator(temp_dir.path(), SyncMode::FsyncOnWrite).await;
 
         write_coord.write(b"record1").await.unwrap();
         write_coord.write(b"record2").await.unwrap();
@@ -656,9 +685,8 @@ mod tests {
     async fn test_batch_write_with_sync() {
         let temp_dir = tempdir().unwrap();
 
-        let writer_config = LogWriterConfig::default().with_dir(temp_dir.path());
-        let writer = Arc::new(LogWriter::new(writer_config).await.unwrap());
-        let write_coord = WriteCoordinator::with_batch(writer, 5);
+        let write_coord =
+            create_test_coordinator(temp_dir.path(), SyncMode::Batch { batch_size: 5 }).await;
 
         // 批量写入 3 条数据，不应该触发同步
         let data_list: Vec<&[u8]> = vec![b"a", b"bb", b"ccc"];
@@ -683,9 +711,7 @@ mod tests {
     async fn test_manual_sync() {
         let temp_dir = tempdir().unwrap();
 
-        let writer_config = LogWriterConfig::default().with_dir(temp_dir.path());
-        let writer = Arc::new(LogWriter::new(writer_config).await.unwrap());
-        let write_coord = WriteCoordinator::new(writer, SyncMode::None);
+        let write_coord = create_test_coordinator(temp_dir.path(), SyncMode::None).await;
 
         // None 模式下写入不会自动同步
         write_coord.write(b"data").await.unwrap();

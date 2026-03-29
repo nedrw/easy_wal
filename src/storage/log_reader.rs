@@ -167,22 +167,76 @@ impl LogReader {
     /// 读取原始数据（不解析格式）
     ///
     /// 用于预读优化，直接从存储读取原始字节。
+    ///
+    /// # 跨段读取特性
+    /// - 当到达当前段末尾（读取不足预期长度）时，自动切换到下一个段继续读取
+    /// - 合并多个段的数据，确保返回足够长度的原始字节
+    /// - 适用于 ReadCoordinator 的预读缓冲区策略
+    /// - 保证多段 WAL 文件恢复后能够完整读取所有数据
     pub async fn read_raw(&self, length: usize) -> Result<Vec<u8>> {
-        let pos = self.position.read().await;
-        let storage = match self.get_storage_for_segment(pos.segment_id).await {
-            Ok(s) => s,
-            Err(Error::Generic(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
+        let mut result = Vec::new();
+        let mut remaining = length;
 
-        let data = storage.read(pos.offset, length as u64).await?;
+        while remaining > 0 {
+            let (segment_id, offset) = {
+                let pos = self.position.read().await;
+                (pos.segment_id, pos.offset)
+            };
 
-        // 更新位置
-        drop(pos);
-        let mut write_pos = self.position.write().await;
-        write_pos.offset += data.len() as u64;
+            let storage = match self.get_storage_for_segment(segment_id).await {
+                Ok(s) => s,
+                Err(Error::Generic(_)) => {
+                    // 当前段不存在，尝试切换到下一个段
+                    let next_segment_id = segment_id + 1;
+                    let manager = self.segment_manager.read().await;
+                    if manager.get_segment(next_segment_id).is_some() {
+                        drop(manager);
+                        let mut pos = self.position.write().await;
+                        pos.segment_id = next_segment_id;
+                        pos.offset = format::SEGMENT_HEADER_SIZE;
+                        continue;
+                    } else {
+                        // 没有下一个段，返回已读取的数据
+                        if result.is_empty() {
+                            return Ok(Vec::new());
+                        } else {
+                            return Ok(result);
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            };
 
-        Ok(data)
+            // 从当前段读取数据
+            let data = storage.read(offset, remaining as u64).await?;
+            let read_len = data.len();
+
+            if read_len == 0 {
+                // 到达段末尾，尝试切换到下一个段
+                let next_segment_id = segment_id + 1;
+                let manager = self.segment_manager.read().await;
+                if manager.get_segment(next_segment_id).is_some() {
+                    drop(manager);
+                    let mut pos = self.position.write().await;
+                    pos.segment_id = next_segment_id;
+                    pos.offset = format::SEGMENT_HEADER_SIZE;
+                    continue;
+                } else {
+                    // 没有下一个段，返回已读取的数据
+                    return Ok(result);
+                }
+            }
+
+            // 添加读取的数据到结果
+            result.extend_from_slice(&data);
+            remaining -= read_len;
+
+            // 更新位置
+            let mut pos = self.position.write().await;
+            pos.offset += read_len as u64;
+        }
+
+        Ok(result)
     }
 
     /// 获取指定段的路径
@@ -197,69 +251,88 @@ impl LogReader {
     /// 从当前位置读取一条数据，并更新位置。
     /// 格式：[4B Magic][4B Length][4B CRC32][Data...]
     pub async fn read_next(&self) -> Result<Vec<u8>> {
-        // 先获取当前位置（释放锁后再做IO）
-        let (segment_id, offset) = {
-            let pos = self.position.read().await;
-            (pos.segment_id, pos.offset)
-        };
+        loop {
+            // 先获取当前位置（释放锁后再做IO）
+            let (segment_id, offset) = {
+                let pos = self.position.read().await;
+                (pos.segment_id, pos.offset)
+            };
 
-        let storage = self.get_storage_for_segment(segment_id).await?;
+            let storage = self.get_storage_for_segment(segment_id).await?;
 
-        // 预读整个记录头 (12 bytes: 4 magic + 4 length + 4 crc)
-        // 优化：从 4 次独立 IO 减少为 2 次（1 次预读头 + 1 次读数据）
-        let header = storage.read(offset, format::RECORD_HEADER_SIZE).await?;
-        if header.len() < format::RECORD_HEADER_SIZE as usize {
-            return Err(Error::Eof);
+            // 预读整个记录头 (12 bytes: 4 magic + 4 length + 4 crc)
+            // 优化：从 4 次独立 IO 减少为 2 次（1 次预读头 + 1 次读数据）
+            let header = storage.read(offset, format::RECORD_HEADER_SIZE).await?;
+
+            // 如果读取不足记录头大小，说明到达段末尾
+            if header.len() < format::RECORD_HEADER_SIZE as usize {
+                // 尝试切换到下一个段
+                let next_segment_id = segment_id + 1;
+
+                // 检查是否有下一个段
+                let manager = self.segment_manager.read().await;
+                if manager.get_segment(next_segment_id).is_some() {
+                    // 切换到下一个段
+                    drop(manager);
+                    let mut pos = self.position.write().await;
+                    pos.segment_id = next_segment_id;
+                    pos.offset = format::SEGMENT_HEADER_SIZE;
+                    continue; // 继续循环，读取下一个段
+                } else {
+                    // 没有下一个段，返回 EOF
+                    return Err(Error::Eof);
+                }
+            }
+
+            // 解析 Magic
+            let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+            if magic != format::RECORD_MAGIC {
+                return Err(Error::Generic(format!(
+                    "Invalid record magic: {:08x}",
+                    magic
+                )));
+            }
+
+            // 解析 Length
+            let length = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as u64;
+
+            // 验证长度合理性
+            if length == 0 || length > format::MAX_RECORD_SIZE {
+                return Err(Error::Generic(format!("Invalid record length: {}", length)));
+            }
+
+            // 解析 CRC32
+            let expected_crc = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
+
+            // 读取数据
+            let data_offset = offset + format::RECORD_HEADER_SIZE;
+            let data = storage.read(data_offset, length).await?;
+
+            // 完整性保护：验证实际读取的字节数与声明的长度一致
+            // 防止 IO 中途文件被截断导致读到不完整数据
+            if data.len() as u64 != length {
+                return Err(Error::Generic(format!(
+                    "Incomplete read: expected {} bytes, got {}",
+                    length,
+                    data.len()
+                )));
+            }
+
+            // 验证 CRC32
+            let actual_crc = crc32(&data);
+            if actual_crc != expected_crc {
+                return Err(Error::Generic(format!(
+                    "CRC32 mismatch: expected {:08x}, got {:08x}",
+                    expected_crc, actual_crc
+                )));
+            }
+
+            // 更新位置（IO完成后再次获取锁）
+            let mut write_pos = self.position.write().await;
+            write_pos.offset = data_offset + length;
+
+            return Ok(data);
         }
-
-        // 解析 Magic
-        let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-        if magic != format::RECORD_MAGIC {
-            return Err(Error::Generic(format!(
-                "Invalid record magic: {:08x}",
-                magic
-            )));
-        }
-
-        // 解析 Length
-        let length = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as u64;
-
-        // 验证长度合理性
-        if length == 0 || length > format::MAX_RECORD_SIZE {
-            return Err(Error::Generic(format!("Invalid record length: {}", length)));
-        }
-
-        // 解析 CRC32
-        let expected_crc = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
-
-        // 读取数据
-        let data_offset = offset + format::RECORD_HEADER_SIZE;
-        let data = storage.read(data_offset, length).await?;
-
-        // 完整性保护：验证实际读取的字节数与声明的长度一致
-        // 防止 IO 中途文件被截断导致读到不完整数据
-        if data.len() as u64 != length {
-            return Err(Error::Generic(format!(
-                "Incomplete read: expected {} bytes, got {}",
-                length,
-                data.len()
-            )));
-        }
-
-        // 验证 CRC32
-        let actual_crc = crc32(&data);
-        if actual_crc != expected_crc {
-            return Err(Error::Generic(format!(
-                "CRC32 mismatch: expected {:08x}, got {:08x}",
-                expected_crc, actual_crc
-            )));
-        }
-
-        // 更新位置（IO完成后再次获取锁）
-        let mut write_pos = self.position.write().await;
-        write_pos.offset = data_offset + length;
-
-        Ok(data)
     }
 
     /// 跳到指定位置
@@ -302,7 +375,7 @@ impl LogReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{LogWriter, LogWriterConfig};
+    use crate::storage::{SegmentConfig, SegmentManager};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -337,20 +410,20 @@ mod tests {
     async fn test_segment_count() {
         let temp_dir = tempdir().unwrap();
 
-        let writer_config = LogWriterConfig::default()
-            .with_dir(temp_dir.path())
-            .with_max_segment_size(10); // 小 size 便于触发轮转
-        let writer = LogWriter::new(writer_config).await.unwrap();
+        // 手动创建多个段文件
+        let segment_config = SegmentConfig::new(temp_dir.path());
+        let mut segment_manager = SegmentManager::new(segment_config).unwrap();
 
-        // 写入数据触发轮转
-        writer.write(b"12345678901").await.unwrap(); // 11 bytes
-        writer.sync().await.unwrap();
-        writer.close().await.unwrap();
+        // 创建3个段
+        segment_manager.create_segment().unwrap();
+        segment_manager.create_segment().unwrap();
+        segment_manager.create_segment().unwrap();
 
+        // 测试 LogReader 的段计数功能
         let reader_config = LogReaderConfig::default().with_dir(temp_dir.path());
         let reader = LogReader::new(reader_config).await.unwrap();
 
         let count = reader.segment_count().await;
-        assert!(count >= 1);
+        assert_eq!(count, 3);
     }
 }

@@ -132,7 +132,6 @@ async fn test_wal_manager_segment_rotation_with_recovery() {
     }
 
     let segments = wal.segments().await;
-    // 由于是顺序写入，段轮转可能发生也可能不发生，取决于数据大小
     assert!(segments.len() >= 1, "应该至少有1个段");
 
     // 创建检查点
@@ -162,7 +161,6 @@ async fn test_wal_manager_segment_rotation_with_recovery() {
 // ============================================================================
 // RecoveryManager 场景测试
 // ============================================================================
-
 #[tokio::test]
 async fn test_recovery_normal_case() {
     let temp_dir = tempdir().unwrap();
