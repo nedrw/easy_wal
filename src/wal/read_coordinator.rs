@@ -267,7 +267,7 @@ impl ReadCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{LogReaderConfig, LogWriter, LogWriterConfig, SegmentConfig};
+    use crate::storage::{LogReaderConfig, SegmentConfig};
     use crate::wal::{CommitConfig, CommitCoordinator, RotationConfig, SegmentCoordinator};
     use tempfile::tempdir;
 

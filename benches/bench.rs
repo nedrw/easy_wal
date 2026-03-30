@@ -12,8 +12,7 @@
 /// - 崩溃恢复 (Crash Recovery)
 /// - 并发写入 (Concurrent Write)
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use easy_wal::{RecoveryMode, SyncMode, WalBuilder};
-use std::hint::black_box;
+use easy_wal::{RecoveryMode, WalBuilder};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -23,19 +22,8 @@ use tempfile::tempdir;
 // 辅助函数
 // ============================================================
 
-fn create_wal(
-    rt: &tokio::runtime::Runtime,
-    dir: &std::path::Path,
-    sync: SyncMode,
-) -> easy_wal::WalManager {
-    rt.block_on(async {
-        WalBuilder::new()
-            .with_dir(dir)
-            .with_sync_mode(sync)
-            .build()
-            .await
-            .unwrap()
-    })
+fn create_wal(rt: &tokio::runtime::Runtime, dir: &std::path::Path) -> easy_wal::WalManager {
+    rt.block_on(async { WalBuilder::new().with_dir(dir).build().await.unwrap() })
 }
 
 // ============================================================
@@ -49,11 +37,11 @@ fn bench_write_throughput(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
 
-    // 1KB sync write
-    group.bench_function("write_1kb_sync", |b| {
+    // 1KB write
+    group.bench_function("write_1kb", |b| {
         b.iter(|| {
             let temp_dir = tempdir().unwrap();
-            let wal = create_wal(&rt, temp_dir.path(), SyncMode::FsyncOnWrite);
+            let wal = create_wal(&rt, temp_dir.path());
             let data = vec![0u8; 1024];
             for _ in 0..1000 {
                 rt.block_on(wal.write(&data)).unwrap();
@@ -62,24 +50,11 @@ fn bench_write_throughput(c: &mut Criterion) {
         });
     });
 
-    // 1KB no sync write
-    group.bench_function("write_1kb_nosync", |b| {
+    // 100B write
+    group.bench_function("write_100b", |b| {
         b.iter(|| {
             let temp_dir = tempdir().unwrap();
-            let wal = create_wal(&rt, temp_dir.path(), SyncMode::None);
-            let data = vec![0u8; 1024];
-            for _ in 0..1000 {
-                rt.block_on(wal.write(&data)).unwrap();
-            }
-            rt.block_on(wal.close()).unwrap();
-        });
-    });
-
-    // 100B sync write
-    group.bench_function("write_100b_sync", |b| {
-        b.iter(|| {
-            let temp_dir = tempdir().unwrap();
-            let wal = create_wal(&rt, temp_dir.path(), SyncMode::FsyncOnWrite);
+            let wal = create_wal(&rt, temp_dir.path());
             let data = vec![0u8; 100];
             for _ in 0..1000 {
                 rt.block_on(wal.write(&data)).unwrap();
@@ -108,7 +83,6 @@ fn bench_read_throughput(c: &mut Criterion) {
             let wal = rt.block_on(async {
                 let wal = WalBuilder::new()
                     .with_dir(temp_dir.path())
-                    .with_sync_mode(SyncMode::None)
                     .build()
                     .await
                     .unwrap();
@@ -150,7 +124,7 @@ fn bench_batch_write(c: &mut Criterion) {
     group.bench_function("batch_10_write_1kb", |b| {
         b.iter(|| {
             let temp_dir = tempdir().unwrap();
-            let wal = create_wal(&rt, temp_dir.path(), SyncMode::None);
+            let wal = create_wal(&rt, temp_dir.path());
             let data = vec![0u8; 1024];
             for _ in 0..100 {
                 let batch: Vec<&[u8]> = std::iter::repeat(&*data).take(10).collect();
@@ -163,7 +137,7 @@ fn bench_batch_write(c: &mut Criterion) {
     group.bench_function("batch_100_write_100b", |b| {
         b.iter(|| {
             let temp_dir = tempdir().unwrap();
-            let wal = create_wal(&rt, temp_dir.path(), SyncMode::None);
+            let wal = create_wal(&rt, temp_dir.path());
             let data = vec![0u8; 100];
             for _ in 0..10 {
                 let batch: Vec<&[u8]> = std::iter::repeat(&*data).take(100).collect();
@@ -193,7 +167,6 @@ fn bench_batch_read(c: &mut Criterion) {
             let wal = rt.block_on(async {
                 let wal = WalBuilder::new()
                     .with_dir(temp_dir.path())
-                    .with_sync_mode(SyncMode::None)
                     .build()
                     .await
                     .unwrap();
@@ -239,7 +212,7 @@ fn bench_recovery(c: &mut Criterion) {
 
             // 第一阶段：写入部分数据并创建检查点
             {
-                let wal = create_wal(&rt, &dir_path, SyncMode::None);
+                let wal = create_wal(&rt, &dir_path);
                 let data = vec![0u8; 1024];
                 for _ in 0..500 {
                     rt.block_on(wal.write(&data)).unwrap();
@@ -250,7 +223,7 @@ fn bench_recovery(c: &mut Criterion) {
 
             // 第二阶段：写入更多数据（不关闭，模拟崩溃）
             {
-                let wal = create_wal(&rt, &dir_path, SyncMode::None);
+                let wal = create_wal(&rt, &dir_path);
                 let data = vec![0u8; 1024];
                 for _ in 0..500 {
                     rt.block_on(wal.write(&data)).unwrap();
@@ -260,7 +233,7 @@ fn bench_recovery(c: &mut Criterion) {
 
             // 第三阶段：恢复
             {
-                let wal = create_wal(&rt, &dir_path, SyncMode::None);
+                let wal = create_wal(&rt, &dir_path);
                 let result = rt.block_on(wal.recover(RecoveryMode::FullScan)).unwrap();
 
                 // 验证恢复的记录数
@@ -296,29 +269,26 @@ fn bench_recovery(c: &mut Criterion) {
 
 fn bench_concurrent_write(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let handle = rt.handle().clone();
 
     let mut group = c.benchmark_group("concurrent_write");
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
 
-    group.bench_function("4_tasks_1k_records_each", |b| {
+    group.bench_function("4tasks", |b| {
         b.iter(|| {
             let temp_dir = tempdir().unwrap();
-            let handle = handle.clone();
-            let wal = Arc::new(create_wal(&rt, temp_dir.path(), SyncMode::None));
+            let wal = Arc::new(create_wal(&rt, temp_dir.path()));
+            let rt_handle = rt.handle().clone();
 
             let handles: Vec<_> = (0..4)
                 .map(|task_id| {
                     let wal = wal.clone();
-                    let handle = handle.clone();
+                    let rt = rt_handle.clone();
                     thread::spawn(move || {
                         let data = format!("task_{}_data", task_id);
-                        let _ = handle.block_on(async {
-                            for _ in 0..1000 {
-                                wal.write(data.as_bytes()).await.unwrap();
-                            }
-                        });
+                        for _ in 0..100 {
+                            let _ = rt.block_on(wal.write(data.as_bytes()));
+                        }
                     })
                 })
                 .collect();
@@ -331,7 +301,7 @@ fn bench_concurrent_write(c: &mut Criterion) {
         });
     });
 
-    group.throughput(Throughput::Elements(4000));
+    group.finish();
 }
 
 // ============================================================
@@ -342,13 +312,13 @@ fn bench_qps_overall(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let mut group = c.benchmark_group("qps_overall");
-    group.warm_up_time(Duration::from_secs(2));
+    group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(5));
 
-    group.bench_function("qps_100k_target", |b| {
+    group.bench_function("100b_5s", |b| {
         b.iter(|| {
             let temp_dir = tempdir().unwrap();
-            let wal = create_wal(&rt, temp_dir.path(), SyncMode::None);
+            let wal = create_wal(&rt, temp_dir.path());
 
             let data = vec![0u8; 100]; // 100 字节
             let start = std::time::Instant::now();
@@ -358,17 +328,13 @@ fn bench_qps_overall(c: &mut Criterion) {
             while start.elapsed().as_secs() < 5 && count < 100000 {
                 rt.block_on(wal.write(&data)).unwrap();
                 count += 1;
-                black_box(count);
             }
-
-            let elapsed = start.elapsed();
-            let qps = count as f64 / elapsed.as_secs_f64();
-
-            println!("QPS: {:.2} ({} records in {:?})", qps, count, elapsed);
 
             rt.block_on(wal.close()).unwrap();
         });
     });
+
+    group.finish();
 }
 
 criterion_group!(
