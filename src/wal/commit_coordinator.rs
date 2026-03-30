@@ -2,14 +2,15 @@
 // !
 // ! 负责协调多个 writer 的写入批次，通过 group commit 优化 I/O 性能。
 
+use super::writer_handle::WriterHandle;
 use crate::prelude::*;
 use crate::storage::WritePosition;
 use crate::wal::segment_coordinator::SegmentCoordinator;
 use std::cmp::Ordering;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::{Duration, Instant};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, oneshot};
 use tracing::{error, info};
 
@@ -181,6 +182,97 @@ pub struct CommitStats {
     pub group_commits: u64,
     /// 单批次提交次数（未成组）
     pub single_commits: u64,
+    /// 总写入次数（writer 统计）
+    pub total_writes: u64,
+}
+
+/// Writer 标识符
+pub type WriterId = u64;
+
+/// 写入模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    /// 单写模式（直接写入，无 Group Commit 开销）
+    Single,
+    /// 多写模式（Group Commit）
+    Multi,
+}
+
+/// Writer 元数据
+#[derive(Debug)]
+pub struct WriterMeta {
+    /// Writer ID
+    pub id: WriterId,
+    /// Writer 名称
+    pub name: Option<String>,
+    /// 创建时间
+    pub created_at: std::time::Instant,
+    /// Writer 统计信息
+    pub stats: std::sync::Mutex<WriterStats>,
+}
+
+/// Writer 统计信息
+#[derive(Debug, Clone, Default)]
+pub struct WriterStats {
+    /// 写入次数
+    pub write_count: u64,
+    /// 写入字节数
+    pub write_bytes: u64,
+    /// 写入记录数
+    pub write_records: u64,
+}
+
+/// Writer 注册表
+pub struct WriterRegistry {
+    /// 注册的 writers
+    writers: RwLock<std::collections::HashMap<WriterId, Arc<WriterMeta>>>,
+    /// 下一个 Writer ID
+    next_writer_id: AtomicU64,
+}
+
+impl WriterRegistry {
+    /// 创建新的 Writer 注册表
+    fn new() -> Self {
+        Self {
+            writers: RwLock::new(std::collections::HashMap::new()),
+            next_writer_id: AtomicU64::new(1),
+        }
+    }
+
+    /// 注册 writer
+    async fn register(&self, name: Option<String>) -> Result<(WriterId, Arc<WriterMeta>)> {
+        let writer_id = self.next_writer_id.fetch_add(1, AtomicOrdering::AcqRel);
+
+        let meta = Arc::new(WriterMeta {
+            id: writer_id,
+            name,
+            created_at: std::time::Instant::now(),
+            stats: std::sync::Mutex::new(WriterStats::default()),
+        });
+
+        {
+            let mut writers = self.writers.write().await;
+            writers.insert(writer_id, meta.clone());
+        }
+
+        info!("Writer {} registered", writer_id);
+        Ok((writer_id, meta))
+    }
+
+    /// 注销 writer
+    async fn unregister(&self, writer_id: WriterId) -> Result<()> {
+        let mut writers = self.writers.write().await;
+        if writers.remove(&writer_id).is_some() {
+            info!("Writer {} unregistered", writer_id);
+        }
+        Ok(())
+    }
+
+    /// 获取 writer 数量
+    async fn count(&self) -> u64 {
+        let writers = self.writers.read().await;
+        writers.len() as u64
+    }
 }
 
 // ===================== Commit Coordinator =====================
@@ -262,6 +354,10 @@ pub struct CommitCoordinator {
     segment_coordinator: Arc<SegmentCoordinator>,
     /// 统计信息
     stats: Arc<RwLock<CommitStats>>,
+    /// Writer 注册表
+    writer_registry: Arc<WriterRegistry>,
+    /// 模式：单写优化标志
+    single_writer_mode: AtomicBool,
 }
 
 impl CommitCoordinator {
@@ -277,6 +373,8 @@ impl CommitCoordinator {
             commit_wakeup: Arc::new(tokio::sync::Notify::new()),
             segment_coordinator,
             stats: Arc::new(RwLock::new(CommitStats::default())),
+            writer_registry: Arc::new(WriterRegistry::new()),
+            single_writer_mode: AtomicBool::new(true),
         })
     }
 
@@ -288,8 +386,44 @@ impl CommitCoordinator {
         });
     }
 
+    /// 注册 writer，返回 WriterHandle
+    pub async fn register_writer(&self, name: Option<String>) -> Result<WriterHandle> {
+        let (writer_id, meta) = self.writer_registry.register(name).await?;
+
+        // 检查是否需要切换模式
+        let writer_count = self.writer_registry.count().await;
+        if writer_count > 1 {
+            self.single_writer_mode
+                .store(false, AtomicOrdering::Release);
+            info!("Switched to multi-writer mode ({} writers)", writer_count);
+        }
+
+        Ok(WriterHandle::new(writer_id, Arc::new(self.clone()), meta))
+    }
+
+    /// 注销 writer
+    pub async fn unregister_writer(&self, writer_id: WriterId) -> Result<()> {
+        self.writer_registry.unregister(writer_id).await?;
+
+        // 检查是否需要切换回单写模式
+        let writer_count = self.writer_registry.count().await;
+        if writer_count <= 1 {
+            self.single_writer_mode.store(true, AtomicOrdering::Release);
+            info!("Switched to single-writer mode ({} writers)", writer_count);
+        }
+
+        Ok(())
+    }
+
     /// 添加批次到提交队列
     pub async fn add_batch(&self, batch: Arc<WriteBatch>) {
+        // 单写模式优化：直接处理
+        if self.single_writer_mode.load(AtomicOrdering::Acquire) {
+            self.direct_write(batch).await;
+            return;
+        }
+
+        // 多写模式：加入队列，等待 Group Commit
         {
             let mut state = self.state.write().await;
             state.pending.push(batch);
@@ -336,6 +470,68 @@ impl CommitCoordinator {
             .next_sequence
             .fetch_add(count as u64, AtomicOrdering::AcqRel);
         SequenceNumber::from_u64(base)
+    }
+
+    /// 获取活跃 writer 数量
+    pub async fn writer_count(&self) -> u64 {
+        self.writer_registry.count().await
+    }
+
+    /// 获取当前模式
+    pub fn mode(&self) -> WriteMode {
+        if self.single_writer_mode.load(AtomicOrdering::Acquire) {
+            WriteMode::Single
+        } else {
+            WriteMode::Multi
+        }
+    }
+
+    /// 直接写入（单写模式优化）
+    async fn direct_write(&self, batch: Arc<WriteBatch>) {
+        // 获取活跃写入器
+        let writer = match self.segment_coordinator.get_active_writer().await {
+            Ok(w) => w,
+            Err(e) => {
+                batch.send_result(Err(e));
+                return;
+            }
+        };
+
+        // 执行写入
+        let records: Vec<&[u8]> = batch.records.iter().map(|r| r.as_slice()).collect();
+        let positions = match writer.write_batch(&records).await {
+            Ok(pos) => pos,
+            Err(e) => {
+                batch.send_result(Err(e));
+                return;
+            }
+        };
+
+        // 同步
+        if let Err(e) = writer.sync().await {
+            batch.send_result(Err(e));
+            return;
+        }
+
+        // 更新段大小
+        let header_size = 12u64;
+        let bytes_written = batch.size_bytes as u64 + batch.records.len() as u64 * header_size;
+        self.segment_coordinator
+            .update_size(bytes_written, batch.records.len() as u64)
+            .await;
+
+        // 检查轮转
+        let _ = self.segment_coordinator.check_and_rotate().await;
+
+        // 发送结果
+        batch.send_result(Ok(positions));
+
+        // 更新统计
+        let mut stats = self.stats.write().await;
+        stats.total_batches += 1;
+        stats.total_records += batch.records.len() as u64;
+        stats.total_bytes += batch.size_bytes as u64;
+        stats.single_commits += 1;
     }
 
     /// Commit loop
@@ -495,6 +691,10 @@ impl Clone for CommitCoordinator {
             commit_wakeup: Arc::new(tokio::sync::Notify::new()),
             segment_coordinator: self.segment_coordinator.clone(),
             stats: self.stats.clone(),
+            writer_registry: Arc::clone(&self.writer_registry),
+            single_writer_mode: AtomicBool::new(
+                self.single_writer_mode.load(AtomicOrdering::Acquire),
+            ),
         }
     }
 }
@@ -504,16 +704,18 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    async fn create_segment_coordinator() -> Arc<SegmentCoordinator> {
+    async fn create_segment_coordinator() -> (Arc<SegmentCoordinator>, tempfile::TempDir) {
         let temp_dir = tempdir().unwrap();
         let rotation_config = crate::wal::RotationConfig::new().with_max_size(1024 * 1024);
         let segment_config = crate::storage::SegmentConfig::new(temp_dir.path());
 
-        Arc::new(
+        let coordinator = Arc::new(
             SegmentCoordinator::new(rotation_config, segment_config)
                 .await
                 .unwrap(),
-        )
+        );
+
+        (coordinator, temp_dir)
     }
 
     #[test]
@@ -550,7 +752,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_coordinator_creation() {
-        let segment_coordinator = create_segment_coordinator().await;
+        let (segment_coordinator, _temp_dir) = create_segment_coordinator().await;
         let config = CommitConfig::new();
 
         let coordinator = CommitCoordinator::new(config, segment_coordinator)
@@ -562,7 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_and_flush_batch() {
-        let segment_coordinator = create_segment_coordinator().await;
+        let (segment_coordinator, _temp_dir) = create_segment_coordinator().await;
         let config = CommitConfig::default();
 
         let coordinator = CommitCoordinator::new(config, segment_coordinator)
@@ -613,7 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multi_batch_positions() {
-        let segment_coordinator = create_segment_coordinator().await;
+        let (segment_coordinator, _temp_dir) = create_segment_coordinator().await;
         let config = CommitConfig::default();
 
         let coordinator = CommitCoordinator::new(config, segment_coordinator)

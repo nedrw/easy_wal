@@ -6,8 +6,9 @@
 //! - 学习组件集成
 
 use super::{
-    Checkpoint, CheckpointPosition, ReadCoordinator, RecoveryManager, RecoveryMode, RecoveryResult,
-    RotationConfig, SegmentCoordinator, SyncMode, WriteCoordinator,
+    Checkpoint, CheckpointPosition, CommitConfig, CommitCoordinator, CommitStats, ReadCoordinator,
+    RecoveryManager, RecoveryMode, RecoveryResult, RotationConfig, SegmentCoordinator, SyncMode,
+    WriteMode, WriterHandle,
 };
 use crate::prelude::*;
 use crate::storage::{LogReader, LogReaderConfig, SegmentConfig, WritePosition};
@@ -27,6 +28,8 @@ pub struct WalConfig {
     pub batch_size: usize,
     /// 预读缓冲区大小
     pub read_ahead_size: usize,
+    /// Commit 配置（可选）
+    pub commit_config: Option<CommitConfig>,
 }
 
 impl Default for WalConfig {
@@ -37,6 +40,7 @@ impl Default for WalConfig {
             sync_mode: SyncMode::None,
             batch_size: 100,
             read_ahead_size: 64 * 1024, // 64KB
+            commit_config: None,
         }
     }
 }
@@ -67,6 +71,12 @@ impl WalConfig {
         self.read_ahead_size = size;
         self
     }
+
+    /// 设置 Commit 配置
+    pub fn with_commit_config(mut self, config: CommitConfig) -> Self {
+        self.commit_config = Some(config);
+        self
+    }
 }
 
 /// WAL 记录
@@ -78,16 +88,20 @@ pub struct Record {
     pub position: WritePosition,
 }
 
-/// WAL 管理器
+/// WAL 管理器（简化版）
 ///
-/// 提供统一的读写接口，内部协调 WriteCoordinator 和 ReadCoordinator。
+/// 统一使用 CommitCoordinator，无需区分单写/多写模式。
 pub struct WalManager {
-    write_coordinator: Arc<WriteCoordinator>,
+    /// CommitCoordinator（唯一协调器）
+    commit_coordinator: Arc<CommitCoordinator>,
+    /// ReadCoordinator
     read_coordinator: Arc<ReadCoordinator>,
+    /// RecoveryManager
     recovery_manager: RecoveryManager,
+    /// 配置
     config: WalConfig,
-    /// 优雅关闭信号
-    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// 当前同步模式（用于运行时切换，向后兼容）
+    current_sync_mode: tokio::sync::RwLock<SyncMode>,
 }
 
 impl WalManager {
@@ -102,9 +116,13 @@ impl WalManager {
         let segment_coordinator =
             Arc::new(SegmentCoordinator::new(rotation_config, segment_config).await?);
 
-        // 创建写入协调器（改造：使用 SegmentCoordinator）
-        let write_coordinator =
-            Arc::new(WriteCoordinator::new(segment_coordinator, config.sync_mode));
+        // 创建 CommitCoordinator（统一协调器）
+        let commit_config = config.commit_config.clone().unwrap_or_default();
+        let commit_coordinator =
+            Arc::new(CommitCoordinator::new(commit_config, segment_coordinator).await?);
+
+        // 启动 commit loop
+        commit_coordinator.start();
 
         // 创建读取器（不变）
         let reader_config = LogReaderConfig::default()
@@ -121,43 +139,15 @@ impl WalManager {
         // 创建恢复管理器（不变）
         let recovery_manager = RecoveryManager::new(&config.dir);
 
-        // 如果配置了周期同步，启动后台任务
-        let shutdown_tx = if let SyncMode::Periodic { interval_ms } = config.sync_mode {
-            let (tx, rx) = tokio::sync::watch::channel(false);
-            let coordinator = write_coordinator.clone();
-
-            tokio::spawn(async move {
-                let interval = tokio::time::Duration::from_millis(interval_ms);
-                let mut rx = rx;
-
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(interval) => {
-                            if let Err(e) = coordinator.check_periodic_sync().await {
-                                tracing::warn!("Periodic sync failed: {}", e);
-                            }
-                        }
-                        _ = rx.changed() => {
-                            if *rx.borrow() {
-                                tracing::debug!("Periodic sync task received shutdown signal");
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-
-            Some(tx)
-        } else {
-            None
-        };
+        // 在移动 config 之前保存 sync_mode 的值
+        let initial_sync_mode = config.sync_mode;
 
         Ok(Self {
-            write_coordinator,
+            commit_coordinator,
             read_coordinator,
             recovery_manager,
             config,
-            shutdown_tx,
+            current_sync_mode: tokio::sync::RwLock::new(initial_sync_mode),
         })
     }
 
@@ -194,14 +184,34 @@ impl WalManager {
         self.recovery_manager.get_recovery_position().await
     }
 
-    /// 写入数据
-    pub async fn write(&self, data: &[u8]) -> Result<WritePosition> {
-        self.write_coordinator.write(data).await
+    /// 注册 writer，返回 WriterHandle
+    ///
+    /// 单个 writer 时自动优化为直接写入，
+    /// 多个 writer 时自动启用 Group Commit。
+    pub async fn register_writer(&self, name: Option<String>) -> Result<WriterHandle> {
+        self.commit_coordinator.register_writer(name).await
     }
 
-    /// 批量写入
+    /// 写入单条数据（便捷方法）
+    ///
+    /// 内部创建临时 writer，适用于简单场景。
+    /// 高性能场景建议使用 `register_writer()` 获取持久化 writer。
+    pub async fn write(&self, data: &[u8]) -> Result<WritePosition> {
+        let writer = self.register_writer(None).await?;
+        let pos = writer.write(data).await?;
+        writer.close().await?;
+        Ok(pos)
+    }
+
+    /// 批量写入（便捷方法）
+    ///
+    /// 内部创建临时 writer，适用于简单场景。
+    /// 高性能场景建议使用 `register_writer()` 获取持久化 writer。
     pub async fn write_batch(&self, data_list: &[&[u8]]) -> Result<Vec<WritePosition>> {
-        self.write_coordinator.write_batch(data_list).await
+        let writer = self.register_writer(None).await?;
+        let positions = writer.write_batch(data_list).await?;
+        writer.close().await?;
+        Ok(positions)
     }
 
     /// 读取下一条记录
@@ -258,21 +268,32 @@ impl WalManager {
         self.read_coordinator.segments().await
     }
 
-    /// 同步数据
-    ///
-    /// 返回同步报告，包含耗时和执行结果。
-    pub async fn sync(&self) -> Result<super::coordinators::SyncReport> {
-        self.write_coordinator.sync().await
+    /// 获取当前写入模式
+    pub fn write_mode(&self) -> WriteMode {
+        self.commit_coordinator.mode()
+    }
+
+    /// 获取活跃 writer 数量
+    pub async fn writer_count(&self) -> u64 {
+        self.commit_coordinator.writer_count().await
+    }
+
+    /// 获取统计信息
+    pub async fn stats(&self) -> CommitStats {
+        self.commit_coordinator.stats().await
+    }
+
+    /// 强制刷新
+    pub async fn flush(&self) -> Result<()> {
+        self.commit_coordinator.flush().await
     }
 
     /// 关闭 WAL
     pub async fn close(&self) -> Result<()> {
-        // 发送关闭信号让后台周期同步任务自然退出
-        if let Some(ref tx) = self.shutdown_tx {
-            let _ = tx.send(true);
-        }
+        // 关闭 CommitCoordinator
+        self.commit_coordinator.shutdown().await;
 
-        self.write_coordinator.close().await?;
+        // 关闭 ReadCoordinator
         self.read_coordinator.close().await
     }
 
@@ -280,35 +301,29 @@ impl WalManager {
     // 监控和配置热更新
     // ============================================================
 
-    /// 获取当前同步模式
+    /// 获取当前同步模式（向后兼容，实际由 CommitConfig 控制）
     ///
-    /// 用于监控和查询当前运行的同步策略
+    /// 注意：CommitCoordinator 使用 CommitConfig 控制行为，
+    /// 此方法返回运行时的 sync_mode，但不直接影响 CommitCoordinator 的行为。
     pub async fn sync_mode(&self) -> SyncMode {
-        self.write_coordinator.sync_mode().await
+        self.current_sync_mode.read().await.clone()
     }
 
-    /// 设置同步模式（运行时修改）
+    /// 设置同步模式（向后兼容，但不推荐使用）
     ///
-    /// 允许在运行时切换同步策略，支持配置热更新。
-    /// 注意：
-    /// - 会重置批量计数器
-    /// - 会重置定时器
-    /// - 不会清除历史统计信息
-    ///
-    /// # 示例
-    /// ```ignore
-    /// // 从批量同步切换到每次写入同步
-    /// wal.set_sync_mode(SyncMode::FsyncOnWrite).await;
-    /// ```
+    /// 注意：此方法仅更新运行时的 sync_mode 值，不影响 CommitCoordinator 的行为。
+    /// 建议使用 `with_commit_config()` 配置 CommitCoordinator。
     pub async fn set_sync_mode(&self, mode: SyncMode) {
-        self.write_coordinator.set_sync_mode(mode).await
+        // 更新运行时的 sync_mode（向后兼容）
+        *self.current_sync_mode.write().await = mode;
+        tracing::warn!("set_sync_mode is deprecated. Use commit_config instead.");
     }
 
-    /// 获取同步统计信息
+    /// 获取同步统计信息（向后兼容）
     ///
-    /// 用于监控同步性能和行为
-    pub async fn sync_stats(&self) -> super::SyncStats {
-        self.write_coordinator.sync_stats().await
+    /// 返回 CommitStats，而不是 SyncStats。
+    pub async fn sync_stats(&self) -> CommitStats {
+        self.commit_coordinator.stats().await
     }
 }
 
@@ -462,13 +477,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wal_periodic_sync_builtin() {
+    async fn test_wal_commit_stats() {
         let temp_dir = tempdir().unwrap();
 
-        // 使用内置周期同步，间隔 50ms
+        // 使用默认配置
         let wal = WalBuilder::new()
             .with_dir(temp_dir.path())
-            .with_sync_mode(SyncMode::Periodic { interval_ms: 50 })
             .build()
             .await
             .unwrap();
@@ -476,14 +490,19 @@ mod tests {
         // 写入一些数据
         wal.write(b"test data").await.unwrap();
 
-        // 等待足够长让定时器触发多次
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        // 在单写模式下，direct_write 会同步更新统计数据
+        // 等待一小段时间确保 commit loop 处理完成（如果有多写模式）
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
 
-        // 检查同步统计
+        // 检查统计
         let stats = wal.sync_stats().await;
         assert!(
-            stats.sync_count > 0,
-            "Periodic sync should have been called"
+            stats.total_batches > 0,
+            "At least one batch should have been committed"
+        );
+        assert!(
+            stats.total_records > 0,
+            "At least one record should have been written"
         );
 
         wal.close().await.unwrap();

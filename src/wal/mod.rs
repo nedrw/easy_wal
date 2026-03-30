@@ -11,15 +11,18 @@ mod recovery;
 mod segment_coordinator;
 mod sync_strategy;
 mod wal_manager;
+mod writer_handle;
 
 pub use commit_coordinator::{
-    CommitConfig, CommitCoordinator, CommitStats, SequenceNumber, WriteBatch,
+    CommitConfig, CommitCoordinator, CommitStats, SequenceNumber, WriteBatch, WriteMode, WriterId,
+    WriterMeta, WriterStats,
 };
 pub use coordinators::{ReadCoordinator, WriteCoordinator};
 pub use recovery::{Checkpoint, CheckpointPosition, RecoveryManager, RecoveryMode, RecoveryResult};
 pub use segment_coordinator::{ExtendedSegmentStats, RotationConfig, SegmentCoordinator};
 pub use sync_strategy::{SyncContext, SyncMode, SyncStats, SyncStrategy};
 pub use wal_manager::{Record, WalBuilder, WalConfig, WalManager};
+pub use writer_handle::WriterHandle;
 
 // 重新导出组件层类型，方便使用
 pub use crate::storage::{
