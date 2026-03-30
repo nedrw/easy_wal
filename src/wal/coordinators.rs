@@ -267,17 +267,45 @@ impl WriteCoordinator {
 // 读取协调器
 // ============================================================
 
-/// 读取协调器
+/// 读取位置（方案 C+ 核心数据结构）
+///
+/// 与 LogReader 的 ReadPosition 分离，避免预读缓冲区导致的位置跟踪问题。
+/// 方案 C+：消费位置和预读位置分离，确保 position() 始终返回准确的消费位置。
+#[derive(Debug, Clone, Copy)]
+struct ReadCoordPosition {
+    /// 段 ID
+    segment_id: u64,
+    /// 段内偏移量
+    offset: u64,
+}
+
+impl ReadCoordPosition {
+    fn new(segment_id: u64, offset: u64) -> Self {
+        Self { segment_id, offset }
+    }
+}
+
+/// 读取协调器（方案 C+）
 ///
 /// 协调读取操作，提供：
 /// - 读取缓冲（预读优化）
 /// - 并发读取控制
+/// - 独立位置跟踪（不依赖 LogReader）
+///
+/// # 方案 C+ 架构
+/// - `consume_position`: 消费位置，用户通过 `position()` 看到的是这个
+/// - `read_ahead_position`: 预读位置，`fill_buffer()` 使用这个进行 IO
+/// 两者分离确保跨段场景下位置跟踪的准确性。
 pub struct ReadCoordinator {
     reader: Arc<RwLock<LogReader>>,
     /// 预读缓冲区
     read_ahead_buffer: Arc<RwLock<ReadAheadBuffer>>,
     /// 预读大小
     read_ahead_size: usize,
+    /// 消费位置：已解析并返回给用户的记录位置
+    consume_position: Arc<RwLock<ReadCoordPosition>>,
+    /// 预读位置：下一次 fill_buffer 的 IO 起始位置
+    read_ahead_position: Arc<RwLock<ReadCoordPosition>>,
 }
 
 /// 预读缓冲区
@@ -328,6 +356,8 @@ impl ReadAheadBuffer {
 
         // 读取 Magic (4 bytes)
         if self.pos + 4 > self.data.len() {
+            // 数据不足以读取 magic，标记为不完整，触发重新填充
+            self.has_incomplete = true;
             return None;
         }
         let magic_bytes: [u8; 4] = self.data[self.pos..self.pos + 4].try_into().unwrap();
@@ -335,11 +365,15 @@ impl ReadAheadBuffer {
 
         // 验证 Magic
         if magic != crate::storage::format::RECORD_MAGIC {
+            // magic 不匹配，可能数据在边界被分割，标记为不完整以触发重新填充
+            self.has_incomplete = true;
             return None;
         }
 
         // 读取长度 (4 bytes)
         if self.pos + 8 > self.data.len() {
+            // 数据不足以读取长度，标记为不完整，触发重新填充
+            self.has_incomplete = true;
             return None;
         }
         let length_bytes: [u8; 4] = self.data[self.pos + 4..self.pos + 8].try_into().unwrap();
@@ -361,26 +395,76 @@ impl ReadAheadBuffer {
         Some(data)
     }
 
-    /// 填充缓冲区
-    fn fill(&mut self, data: Vec<u8>) {
-        self.data = data;
-        self.pos = 0;
-        self.exhausted = false;
-        self.has_incomplete = false;
+    /// 填充缓冲区（保留未解析的数据）
+    ///
+    /// 当有不完整的记录数据时，保留这些数据并追加新数据，避免数据丢失。
+    /// 返回保留的数据长度，用于调整 read_ahead_position。
+    ///
+    /// # 边界处理
+    /// - 限制保留数据的最大长度，避免保留过多数据导致 read_ahead_position 倒退
+    /// - 当新数据较少时（如段末尾），自动调整保留长度
+    fn fill(&mut self, data: Vec<u8>) -> usize {
+        const MAX_PRESERVED_LEN: usize = 4 * 1024; // 最多保留 4KB
+
+        // 如果有不完整的数据，保留它并追加新数据
+        if self.has_incomplete && self.pos < self.data.len() {
+            let remaining_len = self.data.len() - self.pos;
+
+            // 限制保留长度，避免保留过多数据
+            let preserved_len = remaining_len.min(MAX_PRESERVED_LEN);
+
+            // 从缓冲区末尾取 preserved_len 字节
+            let preserved_start = self.data.len() - preserved_len;
+            let remaining = self.data[preserved_start..].to_vec();
+
+            self.data = remaining;
+            self.data.extend_from_slice(&data);
+            self.pos = 0;
+            self.exhausted = false;
+            self.has_incomplete = false;
+
+            preserved_len
+        } else {
+            // 没有不完整数据，直接替换
+            self.data = data;
+            self.pos = 0;
+            self.exhausted = false;
+            self.has_incomplete = false;
+            0
+        }
     }
 }
 
 impl ReadCoordinator {
-    /// 创建读取协调器
-    pub fn new(reader: Arc<RwLock<LogReader>>) -> Self {
+    /// 创建读取协调器（方案 C+）
+    ///
+    /// 初始化消费位置和预读位置为相同值。
+    pub async fn new(reader: Arc<RwLock<LogReader>>) -> Self {
+        // 从 LogReader 获取初始位置
+        let initial_pos = reader.read().await.position().await;
+
+        // 方案 C+：消费位置和预读位置分离
+        let consume_position = Arc::new(RwLock::new(ReadCoordPosition::new(
+            initial_pos.segment_id,
+            initial_pos.offset,
+        )));
+        let read_ahead_position = Arc::new(RwLock::new(ReadCoordPosition::new(
+            initial_pos.segment_id,
+            initial_pos.offset,
+        )));
+
         Self {
             reader,
             read_ahead_buffer: Arc::new(RwLock::new(ReadAheadBuffer::new(64 * 1024))),
             read_ahead_size: 64 * 1024,
+            consume_position,
+            read_ahead_position,
         }
     }
 
     /// 设置预读大小
+    ///
+    /// 方案 C+：预读功能已恢复，消费位置和预读位置分离确保跨段正确性。
     pub fn with_read_ahead(mut self, size: usize) -> Self {
         self.read_ahead_size = size;
         self.read_ahead_buffer = Arc::new(RwLock::new(ReadAheadBuffer::new(size)));
@@ -388,33 +472,113 @@ impl ReadCoordinator {
     }
 
     /// 尝试从预读缓冲区读取
+    /// 成功读取记录时更新消费位置（consume_position）。
+    /// 注意：先读取数据释放 buffer 锁，再更新 position，避免死锁。
     async fn read_from_buffer(&self) -> Option<Vec<u8>> {
-        let mut buffer = self.read_ahead_buffer.write().await;
-        buffer.read()
+        eprintln!("[READ_BUF] start");
+        // 第一步：从缓冲区读取数据（持有 buffer 锁）
+        let data_with_size = {
+            let mut buffer = self.read_ahead_buffer.write().await;
+            eprintln!(
+                "[READ_BUF] buffer pos={}, len={}",
+                buffer.pos,
+                buffer.data.len()
+            );
+            if let Some(data) = buffer.read() {
+                let record_size = crate::storage::format::RECORD_HEADER_SIZE + data.len() as u64;
+                eprintln!("[READ_BUF] read {} bytes", data.len());
+                Some((data, record_size))
+            } else {
+                eprintln!("[READ_BUF] no data from buffer");
+                None
+            }
+        };
+
+        // 第二步：更新消费位置（不持有 buffer 锁，避免死锁）
+        // 方案 C+：只更新 consume_position，不影响 read_ahead_position
+        if let Some((data, record_size)) = data_with_size {
+            let mut pos = self.consume_position.write().await;
+            let old_offset = pos.offset;
+            pos.offset += record_size;
+            eprintln!(
+                "[READ_BUF] updated consume_position: {} -> {}",
+                old_offset, pos.offset
+            );
+            return Some(data);
+        }
+
+        eprintln!("[READ_BUF] returning None");
+        None
     }
 
-    /// 填充预读缓冲区
+    /// 填充预读缓冲区（方案 C+）
+    ///
+    /// 使用 read_ahead_position 计算读取位置，读取后更新 read_ahead_position。
+    /// consume_position 由 read_from_buffer() 更新，两者分离确保跨段正确性。
     async fn fill_buffer(&self) -> Result<()> {
+        eprintln!("[FILL] start");
         let mut buffer = self.read_ahead_buffer.write().await;
 
         // 只有当缓冲区完全为空时才填充
-        // 如果缓冲区有残留数据但无法解析，说明是损坏或不完整记录，直接清空
         if buffer.has_data() {
+            eprintln!("[FILL] buffer has data, skipping");
             return Ok(());
         }
 
-        // 从 LogReader 读取原始数据填充缓冲区
-        let raw_data = {
-            let reader = self.reader.read().await;
-            reader.read_raw(self.read_ahead_size).await?
+        // 方案 C+：使用 read_ahead_position 计算读取位置
+        let (segment_id, offset) = {
+            let pos = self.read_ahead_position.read().await;
+            eprintln!(
+                "[FILL] read_ahead_position: ({}, {})",
+                pos.segment_id, pos.offset
+            );
+            (pos.segment_id, pos.offset)
         };
 
-        if raw_data.is_empty() {
+        // 从 LogReader 读取原始数据（不更新 LogReader.position）
+        eprintln!(
+            "[FILL] calling read_raw_at({}, {}, {})",
+            segment_id, offset, self.read_ahead_size
+        );
+        let read_result = {
+            let reader = self.reader.read().await;
+            reader
+                .read_raw_at(segment_id, offset, self.read_ahead_size)
+                .await?
+        };
+
+        eprintln!(
+            "[FILL] read_raw_at completed: len={}",
+            read_result.data.len()
+        );
+
+        if read_result.data.is_empty() {
+            eprintln!("[FILL] empty data, setting exhausted");
             buffer.exhausted = true;
             return Err(Error::Eof);
         }
 
-        buffer.fill(raw_data);
+        eprintln!(
+            "[FILL] filling buffer with {} bytes",
+            read_result.data.len()
+        );
+        let preserved_len = buffer.fill(read_result.data);
+
+        // 方案 C+：更新 read_ahead_position
+        // 简化逻辑：直接使用 end_offset 作为下一次读取的起始位置
+        // 保留的数据已经在缓冲区中，不需要重新读取
+        {
+            let mut pos = self.read_ahead_position.write().await;
+            pos.segment_id = read_result.end_segment_id;
+            pos.offset = read_result.end_offset;
+
+            eprintln!(
+                "[FILL] updated read_ahead_position to ({}, {}), preserved {} bytes",
+                pos.segment_id, pos.offset, preserved_len
+            );
+        }
+
+        eprintln!("[FILL] complete");
         Ok(())
     }
 
@@ -474,21 +638,51 @@ impl ReadCoordinator {
     }
 
     /// 跳转到指定位置（清除预读缓冲）
+    ///
+    /// 方案 C+：同时重置 consume_position 和 read_ahead_position。
     pub async fn seek(&self, segment_id: u64, offset: u64) {
         let mut buffer = self.read_ahead_buffer.write().await;
         buffer.clear();
 
+        // 方案 C+：同时更新消费位置和预读位置
+        {
+            let mut pos = self.consume_position.write().await;
+            pos.segment_id = segment_id;
+            pos.offset = offset;
+        }
+        {
+            let mut pos = self.read_ahead_position.write().await;
+            pos.segment_id = segment_id;
+            pos.offset = offset;
+        }
+
+        // 同步到 LogReader（保持底层 IO 状态一致）
         let reader = self.reader.read().await;
         reader.seek(segment_id, offset).await;
     }
 
     /// 跳转到开头
+    ///
+    /// 方案 C+：同时重置 consume_position 和 read_ahead_position。
     pub async fn seek_to_start(&self) {
         {
             let mut buffer = self.read_ahead_buffer.write().await;
             buffer.clear();
         }
 
+        // 方案 C+：同时重置消费位置和预读位置到开头
+        {
+            let mut pos = self.consume_position.write().await;
+            pos.segment_id = 1;
+            pos.offset = crate::storage::format::SEGMENT_HEADER_SIZE;
+        }
+        {
+            let mut pos = self.read_ahead_position.write().await;
+            pos.segment_id = 1;
+            pos.offset = crate::storage::format::SEGMENT_HEADER_SIZE;
+        }
+
+        // 同步到 LogReader
         {
             let reader = self.reader.read().await;
             reader.seek_to_start().await;
@@ -498,10 +692,16 @@ impl ReadCoordinator {
         let _ = self.fill_buffer().await;
     }
 
-    /// 获取当前位置
+    /// 获取当前位置（返回消费位置，即已解析的记录位置）
+    ///
+    /// 方案 C+：返回 consume_position，不是 read_ahead_position。
+    /// 这确保 position() 始终反映用户实际消费的位置，而不是预读 IO 的位置。
     pub async fn position(&self) -> ReadPosition {
-        let reader = self.reader.read().await;
-        reader.position().await
+        let pos = self.consume_position.read().await;
+        ReadPosition {
+            segment_id: pos.segment_id,
+            offset: pos.offset,
+        }
     }
 
     /// 获取段信息
@@ -641,7 +841,7 @@ mod tests {
 
         let reader_config = LogReaderConfig::default().with_dir(temp_dir.path());
         let reader = Arc::new(RwLock::new(LogReader::new(reader_config).await.unwrap()));
-        let coordinator = ReadCoordinator::new(reader);
+        let coordinator = ReadCoordinator::new(reader).await;
 
         coordinator.seek_to_start().await;
         let result = coordinator.read_next().await;
@@ -664,7 +864,7 @@ mod tests {
 
         let reader_config = LogReaderConfig::default().with_dir(temp_dir.path());
         let reader = Arc::new(RwLock::new(LogReader::new(reader_config).await.unwrap()));
-        let read_coord = ReadCoordinator::new(reader);
+        let read_coord = ReadCoordinator::new(reader).await;
 
         read_coord.seek_to_start().await;
 

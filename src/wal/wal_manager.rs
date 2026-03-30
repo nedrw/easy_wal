@@ -114,9 +114,12 @@ impl WalManager {
             LogReader::new(reader_config).await?,
         ));
 
-        // 创建读取协调器（不变）
-        let read_coordinator =
-            Arc::new(ReadCoordinator::new(reader).with_read_ahead(config.read_ahead_size));
+        // 创建读取协调器（方案 C：需要 await 初始化）
+        let read_coordinator = Arc::new(
+            ReadCoordinator::new(reader)
+                .await
+                .with_read_ahead(config.read_ahead_size),
+        );
 
         // 创建恢复管理器（不变）
         let recovery_manager = RecoveryManager::new(&config.dir);
@@ -178,12 +181,18 @@ impl WalManager {
     }
 
     /// 创建检查点
+    ///
+    /// 在当前写入位置创建检查点，标记最后有效写入位置。
+    /// 使用写入位置而不是读取位置，确保恢复时能找到正确的起点。
     pub async fn checkpoint(&self) -> Result<Checkpoint> {
-        let pos = self.read_coordinator.position().await;
+        // 获取写入位置（活跃段 ID + 当前大小）
+        let segment_coordinator = self.write_coordinator.segment_coordinator();
+        let segment_id = segment_coordinator.active_segment_id().await;
+        let offset = segment_coordinator.active_segment_size().await;
 
         let checkpoint = self
             .recovery_manager
-            .create_checkpoint(pos.segment_id, pos.offset, pos.offset)
+            .create_checkpoint(segment_id, offset, offset)
             .await?;
 
         Ok(checkpoint)

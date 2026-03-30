@@ -85,6 +85,70 @@ async fn test_long_running_stress() {
     wal.close().await.unwrap();
 }
 
+/// 小规模预读缓冲区验证测试
+///
+/// 快速验证预读缓冲区的多次填充逻辑是否正确：
+/// - 写入足够多数据触发多次 fill_buffer()（200 条记录，约 200KB）
+/// - 验证能否正确读取所有记录
+#[tokio::test]
+async fn test_read_ahead_buffer_verification() {
+    let temp_dir = tempdir().unwrap();
+    let wal = WalBuilder::new()
+        .with_dir(temp_dir.path())
+        .with_sync_mode(SyncMode::FsyncOnWrite)
+        .build()
+        .await
+        .unwrap();
+
+    let data = vec![0u8; 1024]; // 1KB per record
+    let total_records = 200; // 足够触发多次 fill_buffer (64KB buffer)
+
+    println!("Writing {} records (each 1KB)", total_records);
+
+    // 写入数据
+    for i in 0..total_records {
+        wal.write(&data).await.unwrap();
+    }
+
+    println!("Write completed, starting read verification");
+
+    // 同步确保所有数据落盘
+    wal.sync().await.unwrap();
+
+    // 跳到开头读取
+    wal.seek_to_start().await;
+
+    // 读取所有记录
+    let mut read_count = 0u64;
+    loop {
+        match wal.read().await {
+            Ok(_) => read_count += 1,
+            Err(easy_wal::Error::Eof) => break,
+            Err(e) => panic!("Read error at record {}: {:?}", read_count, e),
+        }
+
+        if read_count <= 5 || read_count % 50 == 0 {
+            println!("Read {} records", read_count);
+        }
+    }
+
+    println!("Read completed: {} records", read_count);
+
+    // 验证读取的记录数
+    assert_eq!(
+        read_count, total_records as u64,
+        "Expected {} records, got {} - read-ahead buffer may have lost records",
+        total_records, read_count
+    );
+
+    println!(
+        "Verification passed: all {} records read successfully",
+        read_count
+    );
+
+    wal.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn test_memory_usage_under_load() {
     let temp_dir = tempdir().unwrap();

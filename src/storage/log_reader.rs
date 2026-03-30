@@ -20,6 +20,17 @@ pub struct ReadPosition {
     pub offset: u64,
 }
 
+/// read_raw_at 返回结果
+#[derive(Debug)]
+pub struct ReadRawAtResult {
+    /// 读取的数据
+    pub data: Vec<u8>,
+    /// 读取结束时的段 ID
+    pub end_segment_id: u64,
+    /// 读取结束时的偏移量
+    pub end_offset: u64,
+}
+
 /// 日志读取器配置
 #[derive(Debug, Clone)]
 pub struct LogReaderConfig {
@@ -244,6 +255,90 @@ impl LogReader {
         }
 
         Ok(result)
+    }
+
+    /// 读取原始数据（不解析格式，不更新位置）
+    ///
+    /// 用于预读优化，直接从存储读取原始字节。
+    /// 与 read_raw 不同，此方法不更新内部位置，而是使用指定的段 ID 和偏移量。
+    ///
+    /// # 参数
+    /// - `segment_id`: 段 ID
+    /// - `offset`: 起始偏移量
+    /// - `length`: 读取长度
+    ///
+    /// # 跨段读取特性
+    /// - 当到达当前段末尾时，自动切换到下一个段继续读取
+    /// - 合并多个段的数据，确保返回足够长度的原始字节
+    pub async fn read_raw_at(
+        &self,
+        segment_id: u64,
+        offset: u64,
+        length: usize,
+    ) -> Result<ReadRawAtResult> {
+        let mut result = Vec::new();
+        let mut remaining = length;
+        let mut current_segment_id = segment_id;
+        let mut current_offset = offset;
+
+        while remaining > 0 {
+            let storage = match self.get_storage_for_segment(current_segment_id).await {
+                Ok(s) => s,
+                Err(Error::Generic(_)) => {
+                    // 当前段不存在，尝试切换到下一个段
+                    let next_segment_id = current_segment_id + 1;
+                    let manager = self.segment_manager.read().await;
+                    if manager.get_segment(next_segment_id).is_some() {
+                        drop(manager);
+                        current_segment_id = next_segment_id;
+                        current_offset = format::SEGMENT_HEADER_SIZE;
+                        continue;
+                    } else {
+                        // 没有下一个段，返回已读取的数据
+                        return Ok(ReadRawAtResult {
+                            data: result,
+                            end_segment_id: current_segment_id,
+                            end_offset: current_offset,
+                        });
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+
+            // 从当前段读取数据
+            let data = storage.read(current_offset, remaining as u64).await?;
+            let read_len = data.len();
+
+            if read_len == 0 {
+                // 到达段末尾，尝试切换到下一个段
+                let next_segment_id = current_segment_id + 1;
+                let manager = self.segment_manager.read().await;
+                if manager.get_segment(next_segment_id).is_some() {
+                    drop(manager);
+                    current_segment_id = next_segment_id;
+                    current_offset = format::SEGMENT_HEADER_SIZE;
+                    continue;
+                } else {
+                    // 没有下一个段，返回已读取的数据
+                    return Ok(ReadRawAtResult {
+                        data: result,
+                        end_segment_id: current_segment_id,
+                        end_offset: current_offset,
+                    });
+                }
+            }
+
+            // 添加读取的数据到结果
+            result.extend_from_slice(&data);
+            remaining -= read_len;
+            current_offset += read_len as u64;
+        }
+
+        Ok(ReadRawAtResult {
+            data: result,
+            end_segment_id: current_segment_id,
+            end_offset: current_offset,
+        })
     }
 
     /// 获取指定段的路径
