@@ -5,12 +5,16 @@
 //! - Layer 3: 协调层 - WriteCoordinator, ReadCoordinator, RecoveryManager
 //! - Layer 4: API 层 - WalManager, WalBuilder
 
+mod commit_coordinator;
 mod coordinators;
 mod recovery;
 mod segment_coordinator;
 mod sync_strategy;
 mod wal_manager;
 
+pub use commit_coordinator::{
+    CommitConfig, CommitCoordinator, CommitStats, SequenceNumber, WriteBatch,
+};
 pub use coordinators::{ReadCoordinator, WriteCoordinator};
 pub use recovery::{Checkpoint, CheckpointPosition, RecoveryManager, RecoveryMode, RecoveryResult};
 pub use segment_coordinator::{ExtendedSegmentStats, RotationConfig, SegmentCoordinator};

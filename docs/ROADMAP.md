@@ -23,19 +23,37 @@ Layer 2: 组件层        - LogWriter, LogReader, SegmentManager (src/storage/)
 Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage (src/storage/)
 ```
 
+
+
 ### 阶段进度
 
 | Phase | 目标 | 状态 |
 |-------|------|------|
-| 1 | 存储层重构 | ✅ 完成 |
-| 2 | 文件管理（段轮转） | ✅ 完成 |
-| 3 | 读取功能 | ✅ 完成 |
-| 4 | 感复机制 | ✅ 完成 |
-| 5 | 性能优化 | ✅ 完成 |
-| 6 | 可靠性增强 | ✅ 完成 |
-| 7 | 错误处理与状态查询 | ✅ 完成 |
+| 0 | 段管理架构重构 | ✅ 完成 |
+| 1 | Multi-Writer Core Infrastructure | ✅ 完成 |
+| 2 | 存储层重构 | ✅ 完成 |
+| 3 | 文件管理（段轮转） | ✅ 完成 |
+| 4 | 读取功能 | ✅ 完成 |
+| 5 | 恢复机制 | ✅ 完成 |
+| 6 | 性能优化 | ✅ 完成 |
+| 7 | 可靠性增强 | ✅ 完成 |
+| 8 | 错误处理与状态查询 | ✅ 完成 |
 
 ### 关键里程碑（已完成）
+
+- [x] **段管理架构重构（Phase 0）**
+  - 职责分离：SegmentManager 专注于段文件管理，不再决策轮转
+  - LogWriter 简化：只负责纯粹的数据写入，不管理段生命周期
+  - 新增 SegmentCoordinator：集中管理段轮转策略和段生命周期
+  - WriteCoordinator 改造：使用 SegmentCoordinator 进行统一的段管理
+  - 为 Multi-Writer 场景做好准备
+
+- [x] **Multi-Writer Core Infrastructure（Phase 1）**
+  - CommitCoordinator 实现：Group Commit 核心协调器
+  - WriteBatch/SequenceNumber/CommitConfig 核心类型定义
+  - 批次合并逻辑：多个批次合并为单一写入
+  - tokio 生态：使用 spawn + Notify 实现异步 commit loop
+  - 与 SegmentCoordinator 集成
 
 - [x] **四层架构重构**
   - 清晰的职责分离
@@ -135,35 +153,35 @@ Layer 1: 存储层        - Storage trait, FileStorage, MemoryStorage (src/stora
 
 #### 任务清单
 
-- [ ] **Task 0.1: SegmentManager 简化**
+- [x] **Task 0.1: SegmentManager 简化** ✅ 已完成
   - 移除 `should_rotate()` 决策逻辑
   - `update_active_size()` 只更新大小，不返回轮转决策
   - 保持纯粹的段文件管理职责
-  - 预计工作量：2-3天
+  - 实际工作量：2-3天
 
-- [ ] **Task 0.2: LogWriter 简化**
+- [x] **Task 0.2: LogWriter 简化** ✅ 已完成
   - 移除段轮转决策逻辑
   - 接受外部传入的段路径（由上层提供）
   - 只负责纯粹的数据写入
-  - 预计工作量：3-4天
+  - 实际工作量：3-4天
 
-- [ ] **Task 0.3: 新增 SegmentCoordinator**
+- [x] **Task 0.3: 新增 SegmentCoordinator** ✅ 已完成
   - 实现段轮转策略决策（基于大小、时间等）
   - 管理段生命周期
   - 为写入器提供段路径
-  - 预计工作量：4-5天
+  - 实际工作量：4-5天
 
-- [ ] **Task 0.4: WriteCoordinator 改造**
+- [x] **Task 0.4: WriteCoordinator 改造** ✅ 已完成
   - 使用 `SegmentCoordinator` 代替直接调用 `LogWriter`
   - 在写入后检查是否需要轮转
-  - 预计工作量：2-3天
+  - 实际工作量：2-3天
 
-- [ ] **Task 0.5: 测试与验证**
+- [x] **Task 0.5: 测试与验证** ✅ 已完成
   - 确保重构后功能正确
   - 性能测试（确保无性能退化）
-  - 预计工作量：2天
+  - 实际工作量：2天
 
-**预计总工作量**：2-3周
+**实际总工作量**：2-3周 ✅ 已完成
 
 ---
 
@@ -343,32 +361,28 @@ pub struct CommitCoordinator {
 
 #### 任务清单
 
-- [ ] **Task 1.1: 定义核心类型**
+- [x] **Task 1.1: 定义核心类型** ✅
   - `WriteBatch` - 单个 writer 的写入批次
   - `CommitConfig` - Group Commit 配置
   - `SequenceNumber` - 全局序列号
-  - 预计工作量：1天
 
-- [ ] **Task 1.2: 实现 CommitCoordinator**
+- [x] **Task 1.2: 实现 CommitCoordinator** ✅
   - 提交队列管理
   - 序列号分配
   - 定时器触发的提交循环
   - **与 SegmentCoordinator 集成**
-  - 预计工作量：3-4天
 
-- [ ] **Task 1.3: 实现批次合并逻辑**
+- [x] **Task 1.3: 实现批次合并逻辑** ✅
   - 收集多个批次
   - 合并为单一写入缓冲区
   - 结果通知机制
-  - 预计工作量：2-3天
 
-- [ ] **Task 1.4: 单元测试**
+- [x] **Task 1.4: 单元测试** ✅
   - CommitCoordinator 功能测试
   - 批次合并测试
   - 序列号分配测试
-  - 预计工作量：2天
 
-**预计总工作量**：1-2周
+**已完成**：共 7 个测试全部通过
 
 ---
 
@@ -915,3 +929,9 @@ let config = CommitConfig {
 ## 更新日志
 
 - 2025-01-XX: 创建路线图文档，整合段管理优化和 multi-writer 方案
+- 2026-03-30: Phase 0 段管理架构重构完成
+  - SegmentManager 简化：移除轮转决策逻辑
+  - LogWriter 简化：只负责纯粹的数据写入
+  - 新增 SegmentCoordinator：集中管理段轮转策略
+  - WriteCoordinator 改造：使用 SegmentCoordinator
+  - 所有测试通过，功能验证完成
