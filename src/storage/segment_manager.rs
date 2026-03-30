@@ -147,7 +147,9 @@ impl SegmentManager {
     }
 
     /// 扫描目录中的现有段文件
-    fn scan_segments(config: &SegmentConfig) -> Result<Vec<SegmentMeta>> {
+    ///
+    /// 公开方法，供 LogReader 等外部组件获取最新段信息。
+    pub fn scan_segments(config: &SegmentConfig) -> Result<Vec<SegmentMeta>> {
         let mut segments = Vec::new();
 
         if !config.dir.exists() {
@@ -291,12 +293,11 @@ impl SegmentManager {
     }
 
     /// 获取指定段的路径
+    ///
+    /// 直接根据段 ID 生成路径，不依赖 segments 列表。
+    /// 这使得 LogReader 可以访问由 SegmentCoordinator 创建的新段。
     pub fn segment_path(&self, id: u64) -> Option<PathBuf> {
-        if self.segments.iter().any(|s| s.id == id) {
-            Some(self.make_path(id))
-        } else {
-            None
-        }
+        Some(self.make_path(id))
     }
 
     /// 获取配置

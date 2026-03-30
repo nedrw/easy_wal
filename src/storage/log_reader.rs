@@ -88,29 +88,36 @@ impl LogReader {
     }
 
     /// 获取或创建指定段的存储
+    ///
+    /// 直接根据段 ID 打开文件，不依赖 segment_manager 的 active_id 检查。
+    /// 这使得 LogReader 可以访问由 SegmentCoordinator 创建的新段。
     async fn get_storage_for_segment(&self, segment_id: u64) -> Result<Arc<FileStorage>> {
-        // 先尝试获取现有存储
+        // 先尝试获取现有存储（检查路径是否匹配）
         {
             let storage = self.active_storage.read().await;
             if let Some(ref s) = *storage {
-                let manager = self.segment_manager.read().await;
-                if manager.active_id() == segment_id {
+                // 检查存储路径是否匹配目标段
+                let expected_path = self.config.segment_config.dir.join(format!(
+                    "{}{}.{}",
+                    self.config.segment_config.prefix,
+                    segment_id,
+                    self.config.segment_config.extension
+                ));
+                if s.path() == expected_path {
                     return Ok(s.clone());
                 }
             }
         }
 
-        // 需要加载指定段
-        let manager = self.segment_manager.read().await;
-        let path = manager
-            .segment_path(segment_id)
-            .ok_or_else(|| Error::Generic(format!("Segment {} not found", segment_id)))?;
+        // 直接根据段 ID 生成路径并打开文件
+        let path = self.config.segment_config.dir.join(format!(
+            "{}{}.{}",
+            self.config.segment_config.prefix, segment_id, self.config.segment_config.extension
+        ));
 
-        let storage = Arc::new(
-            FileStorage::new(&path)
-                .await
-                .map_err(|e| Error::Generic(format!("Failed to open storage: {}", e)))?,
-        );
+        let storage = Arc::new(FileStorage::new(&path).await.map_err(|e| {
+            Error::Generic(format!("Failed to open segment {}: {}", segment_id, e))
+        })?);
 
         // 保存到活跃存储
         let mut active = self.active_storage.write().await;
@@ -353,15 +360,17 @@ impl LogReader {
     }
 
     /// 获取所有段信息
+    ///
+    /// 重新扫描磁盘获取最新的段信息，确保返回的元数据是最新的。
     pub async fn segments(&self) -> Vec<super::SegmentMeta> {
-        let manager = self.segment_manager.read().await;
-        manager.segments().to_vec()
+        // 重新扫描磁盘获取最新段信息
+        let config = self.config.segment_config.clone();
+        crate::storage::SegmentManager::scan_segments(&config).unwrap_or_default()
     }
 
     /// 获取段数量
     pub async fn segment_count(&self) -> usize {
-        let manager = self.segment_manager.read().await;
-        manager.segments().len()
+        self.segments().await.len()
     }
 
     /// 关闭读取器
