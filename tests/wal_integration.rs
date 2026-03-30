@@ -838,7 +838,6 @@ async fn test_large_record_batch() {
 }
 
 #[tokio::test]
-#[ignore = "并发写入测试需要深入分析 CommitCoordinator 的处理逻辑，暂时跳过"]
 async fn test_concurrent_write_and_read() {
     use tokio::task::JoinSet;
 

@@ -379,15 +379,15 @@ impl CommitCoordinator {
     }
 
     /// 启动协调器（后台任务）
-    pub fn start(&self) {
-        let this = self.clone();
+    pub fn start(self: &Arc<Self>) {
+        let this = Arc::clone(self);
         tokio::spawn(async move {
             this.commit_loop().await;
         });
     }
 
     /// 注册 writer，返回 WriterHandle
-    pub async fn register_writer(&self, name: Option<String>) -> Result<WriterHandle> {
+    pub async fn register_writer(self: &Arc<Self>, name: Option<String>) -> Result<WriterHandle> {
         let (writer_id, meta) = self.writer_registry.register(name).await?;
 
         // 检查是否需要切换模式
@@ -398,7 +398,7 @@ impl CommitCoordinator {
             info!("Switched to multi-writer mode ({} writers)", writer_count);
         }
 
-        Ok(WriterHandle::new(writer_id, Arc::new(self.clone()), meta))
+        Ok(WriterHandle::new(writer_id, Arc::clone(self), meta))
     }
 
     /// 注销 writer
@@ -682,23 +682,6 @@ impl CommitCoordinator {
     }
 }
 
-impl Clone for CommitCoordinator {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            next_sequence: AtomicU64::new(0),
-            state: RwLock::new(CoordinatorState::default()),
-            commit_wakeup: Arc::new(tokio::sync::Notify::new()),
-            segment_coordinator: self.segment_coordinator.clone(),
-            stats: self.stats.clone(),
-            writer_registry: Arc::clone(&self.writer_registry),
-            single_writer_mode: AtomicBool::new(
-                self.single_writer_mode.load(AtomicOrdering::Acquire),
-            ),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,9 +750,11 @@ mod tests {
         let (segment_coordinator, _temp_dir) = create_segment_coordinator().await;
         let config = CommitConfig::default();
 
-        let coordinator = CommitCoordinator::new(config, segment_coordinator)
-            .await
-            .unwrap();
+        let coordinator = Arc::new(
+            CommitCoordinator::new(config, segment_coordinator)
+                .await
+                .unwrap(),
+        );
 
         // Start coordinator
         coordinator.start();
@@ -818,9 +803,11 @@ mod tests {
         let (segment_coordinator, _temp_dir) = create_segment_coordinator().await;
         let config = CommitConfig::default();
 
-        let coordinator = CommitCoordinator::new(config, segment_coordinator)
-            .await
-            .unwrap();
+        let coordinator = Arc::new(
+            CommitCoordinator::new(config, segment_coordinator)
+                .await
+                .unwrap(),
+        );
 
         coordinator.start();
 
