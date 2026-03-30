@@ -97,34 +97,36 @@ impl FileStorage {
     /// 如果文件为空，写入 16 字节的段文件头。
     /// 如果文件已有内容，不重复写入。
     pub async fn write_header_if_empty(&self) -> Result<()> {
-        let mut file = self.file.write().await;
+        // 文件操作作用域：完成后自动释放文件锁
+        {
+            let mut file = self.file.write().await;
 
-        // 获取当前文件大小
-        let current_size = file
-            .metadata()
-            .await
-            .map_err(|e| Error::Generic(format!("Failed to get metadata: {}", e)))?
-            .len();
+            // 获取当前文件大小
+            let current_size = file
+                .metadata()
+                .await
+                .map_err(|e| Error::Generic(format!("Failed to get metadata: {}", e)))?
+                .len();
 
-        // 如果文件非空，跳过
-        if current_size > 0 {
-            return Ok(());
-        }
+            // 如果文件非空，跳过
+            if current_size > 0 {
+                return Ok(());
+            }
 
-        // 写入段文件头
-        let header = format::SegmentHeader::default();
-        let header_bytes = header.to_bytes();
+            // 写入段文件头
+            let header = format::SegmentHeader::default();
+            let header_bytes = header.to_bytes();
 
-        file.seek(std::io::SeekFrom::Start(0))
-            .await
-            .map_err(|e| Error::Generic(format!("Seek failed: {}", e)))?;
+            file.seek(std::io::SeekFrom::Start(0))
+                .await
+                .map_err(|e| Error::Generic(format!("Seek failed: {}", e)))?;
 
-        file.write_all(&header_bytes)
-            .await
-            .map_err(|e| Error::Generic(format!("Write header failed: {}", e)))?;
+            file.write_all(&header_bytes)
+                .await
+                .map_err(|e| Error::Generic(format!("Write header failed: {}", e)))?;
+        } // file 在此自动释放
 
-        // 更新统计信息
-        drop(file);
+        // 更新统计信息（文件锁已释放）
         {
             let mut stats = self.stats.write().await;
             stats.size = format::SEGMENT_HEADER_SIZE;
@@ -140,28 +142,31 @@ impl FileStorage {
     /// - Ok(None) - 文件为空或太小
     /// - Err - 头无效或版本不匹配
     pub async fn read_header(&self) -> Result<Option<format::SegmentHeader>> {
-        let mut file = self.file.write().await;
+        // 文件操作作用域：完成后自动释放文件锁
+        let header_bytes = {
+            let mut file = self.file.write().await;
 
-        let size = file
-            .metadata()
-            .await
-            .map_err(|e| Error::Generic(format!("Failed to get metadata: {}", e)))?
-            .len();
+            let size = file
+                .metadata()
+                .await
+                .map_err(|e| Error::Generic(format!("Failed to get metadata: {}", e)))?
+                .len();
 
-        if size < format::SEGMENT_HEADER_SIZE {
-            return Ok(None);
-        }
+            if size < format::SEGMENT_HEADER_SIZE {
+                return Ok(None);
+            }
 
-        let mut header_bytes = [0u8; 16];
-        file.seek(std::io::SeekFrom::Start(0))
-            .await
-            .map_err(|e| Error::Generic(format!("Seek failed: {}", e)))?;
+            let mut header_bytes = [0u8; 16];
+            file.seek(std::io::SeekFrom::Start(0))
+                .await
+                .map_err(|e| Error::Generic(format!("Seek failed: {}", e)))?;
 
-        file.read_exact(&mut header_bytes)
-            .await
-            .map_err(|e| Error::Generic(format!("Read header failed: {}", e)))?;
+            file.read_exact(&mut header_bytes)
+                .await
+                .map_err(|e| Error::Generic(format!("Read header failed: {}", e)))?;
 
-        drop(file);
+            header_bytes
+        }; // file 在此自动释放
 
         match format::SegmentHeader::from_bytes(&header_bytes) {
             Ok(header) => Ok(Some(header)),
@@ -262,29 +267,33 @@ impl Storage for FileStorage {
     /// # 实现
     /// 先获取文件大小作为偏移量，然后写入数据
     async fn append(&self, data: &[u8]) -> Result<u64> {
-        let mut file = self.file.write().await;
+        // 文件操作作用域：完成后自动释放文件锁
+        let (offset, bytes_written) = {
+            let mut file = self.file.write().await;
 
-        // 定位到文件末尾并获取当前位置（即偏移量）
-        file.seek(std::io::SeekFrom::End(0))
-            .await
-            .map_err(|e| Error::Generic(format!("Seek failed: {}", e)))?;
-        let offset = file
-            .stream_position()
-            .await
-            .map_err(|e| Error::Generic(format!("Failed to get position: {}", e)))?;
+            // 定位到文件末尾并获取当前位置（即偏移量）
+            file.seek(std::io::SeekFrom::End(0))
+                .await
+                .map_err(|e| Error::Generic(format!("Seek failed: {}", e)))?;
+            let offset = file
+                .stream_position()
+                .await
+                .map_err(|e| Error::Generic(format!("Failed to get position: {}", e)))?;
 
-        // 写入数据
-        file.write_all(data)
-            .await
-            .map_err(|e| Error::Generic(format!("Write failed: {}", e)))?;
+            // 写入数据
+            file.write_all(data)
+                .await
+                .map_err(|e| Error::Generic(format!("Write failed: {}", e)))?;
 
-        // 更新统计信息
-        drop(file);
+            (offset, data.len() as u64)
+        }; // file 在此自动释放
+
+        // 更新统计信息（文件锁已释放）
         {
             let mut stats = self.stats.write().await;
-            stats.bytes_written += data.len() as u64;
+            stats.bytes_written += bytes_written;
             stats.write_ops += 1;
-            stats.size = offset + data.len() as u64;
+            stats.size = offset + bytes_written;
         }
 
         Ok(offset)
@@ -300,45 +309,49 @@ impl Storage for FileStorage {
             return Ok(Vec::new());
         }
 
-        let mut file = self.file.write().await;
+        // 文件操作作用域：完成后自动释放文件锁
+        let (offsets, bytes_written, final_size) = {
+            let mut file = self.file.write().await;
 
-        // 定位到文件末尾并获取起始偏移量
-        file.seek(std::io::SeekFrom::End(0))
-            .await
-            .map_err(|e| Error::Generic(format!("Seek failed: {}", e)))?;
-        let start_offset = file
-            .stream_position()
-            .await
-            .map_err(|e| Error::Generic(format!("Failed to get position: {}", e)))?;
+            // 定位到文件末尾并获取起始偏移量
+            file.seek(std::io::SeekFrom::End(0))
+                .await
+                .map_err(|e| Error::Generic(format!("Seek failed: {}", e)))?;
+            let start_offset = file
+                .stream_position()
+                .await
+                .map_err(|e| Error::Generic(format!("Failed to get position: {}", e)))?;
 
-        // 预先计算每条数据的起始位置
-        let mut offsets = Vec::with_capacity(data_list.len());
-        let mut current_offset = start_offset;
-        for data in data_list {
-            offsets.push(current_offset);
-            current_offset += data.len() as u64;
-        }
+            // 预先计算每条数据的起始位置
+            let mut offsets = Vec::with_capacity(data_list.len());
+            let mut current_offset = start_offset;
+            for data in data_list {
+                offsets.push(current_offset);
+                current_offset += data.len() as u64;
+            }
 
-        // 合并所有数据到单个缓冲区，一次性写入
-        let total_size: usize = data_list.iter().map(|d| d.len()).sum();
-        let mut combined = Vec::with_capacity(total_size);
-        for data in data_list {
-            combined.extend_from_slice(data);
-        }
+            // 合并所有数据到单个缓冲区，一次性写入
+            let total_size: usize = data_list.iter().map(|d| d.len()).sum();
+            let mut combined = Vec::with_capacity(total_size);
+            for data in data_list {
+                combined.extend_from_slice(data);
+            }
 
-        // 一次性写入所有数据
-        file.write_all(&combined)
-            .await
-            .map_err(|e| Error::Generic(format!("Write batch failed: {}", e)))?;
+            // 一次性写入所有数据
+            file.write_all(&combined)
+                .await
+                .map_err(|e| Error::Generic(format!("Write batch failed: {}", e)))?;
 
-        // 计算最终文件大小
-        let final_size = start_offset + combined.len() as u64;
+            let bytes_written = combined.len() as u64;
+            let final_size = start_offset + bytes_written;
 
-        // 更新统计信息
-        drop(file);
+            (offsets, bytes_written, final_size)
+        }; // file 在此自动释放
+
+        // 更新统计信息（文件锁已释放）
         {
             let mut stats = self.stats.write().await;
-            stats.bytes_written += combined.len() as u64;
+            stats.bytes_written += bytes_written;
             stats.write_ops += 1;
             stats.size = final_size;
         }
@@ -440,21 +453,22 @@ impl Storage for FileStorage {
     /// # 实现
     /// 使用 set_len 方法截断文件
     async fn truncate(&self, length: u64) -> Result<()> {
-        let file = self.file.write().await;
+        // 文件操作作用域：完成后自动释放文件锁
+        {
+            let file = self.file.write().await;
 
-        // 先截断文件
-        file.set_len(length)
-            .await
-            .map_err(|e| Error::Generic(format!("Truncate failed: {}", e)))?;
+            // 先截断文件
+            file.set_len(length)
+                .await
+                .map_err(|e| Error::Generic(format!("Truncate failed: {}", e)))?;
 
-        // 同步 trunc 操作到磁盘
-        file.sync_all()
-            .await
-            .map_err(|e| Error::Generic(format!("Sync after truncate failed: {}", e)))?;
+            // 同步 trunc 操作到磁盘
+            file.sync_all()
+                .await
+                .map_err(|e| Error::Generic(format!("Sync after truncate failed: {}", e)))?;
+        } // file 在此自动释放
 
-        drop(file);
-
-        // 更新统计信息
+        // 更新统计信息（文件锁已释放）
         {
             let mut stats = self.stats.write().await;
             stats.size = length;

@@ -188,9 +188,11 @@ impl LogReader {
                 Err(Error::Generic(_)) => {
                     // 当前段不存在，尝试切换到下一个段
                     let next_segment_id = segment_id + 1;
-                    let manager = self.segment_manager.read().await;
-                    if manager.get_segment(next_segment_id).is_some() {
-                        drop(manager);
+                    let has_next = {
+                        let manager = self.segment_manager.read().await;
+                        manager.get_segment(next_segment_id).is_some()
+                    }; // manager 在此自动释放
+                    if has_next {
                         let mut pos = self.position.write().await;
                         pos.segment_id = next_segment_id;
                         pos.offset = format::SEGMENT_HEADER_SIZE;
@@ -214,9 +216,11 @@ impl LogReader {
             if read_len == 0 {
                 // 到达段末尾，尝试切换到下一个段
                 let next_segment_id = segment_id + 1;
-                let manager = self.segment_manager.read().await;
-                if manager.get_segment(next_segment_id).is_some() {
-                    drop(manager);
+                let has_next = {
+                    let manager = self.segment_manager.read().await;
+                    manager.get_segment(next_segment_id).is_some()
+                }; // manager 在此自动释放
+                if has_next {
                     let mut pos = self.position.write().await;
                     pos.segment_id = next_segment_id;
                     pos.offset = format::SEGMENT_HEADER_SIZE;
@@ -270,10 +274,11 @@ impl LogReader {
                 let next_segment_id = segment_id + 1;
 
                 // 检查是否有下一个段
-                let manager = self.segment_manager.read().await;
-                if manager.get_segment(next_segment_id).is_some() {
-                    // 切换到下一个段
-                    drop(manager);
+                let has_next = {
+                    let manager = self.segment_manager.read().await;
+                    manager.get_segment(next_segment_id).is_some()
+                }; // manager 在此自动释放
+                if has_next {
                     let mut pos = self.position.write().await;
                     pos.segment_id = next_segment_id;
                     pos.offset = format::SEGMENT_HEADER_SIZE;

@@ -66,20 +66,22 @@ impl Storage for MemoryStorage {
     /// # 实现
     /// 直接从 Vec 中读取，超出末尾返回已有数据
     async fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
-        let data = self.data.read().await;
-        let offset = offset as usize;
-        let length = length as usize;
+        // 读取操作作用域：完成后自动释放读锁
+        let result = {
+            let data = self.data.read().await;
+            let offset = offset as usize;
+            let length = length as usize;
 
-        // 边界检查
-        if offset >= data.len() {
-            return Ok(Vec::new());
-        }
+            // 边界检查
+            if offset >= data.len() {
+                return Ok(Vec::new());
+            }
 
-        let end = std::cmp::min(offset + length, data.len());
-        let result = data[offset..end].to_vec();
+            let end = std::cmp::min(offset + length, data.len());
+            data[offset..end].to_vec()
+        }; // data 在此自动释放
 
-        // 更新统计信息
-        drop(data);
+        // 更新统计信息（数据锁已释放）
         {
             let mut stats = self.stats.write().await;
             stats.bytes_read += result.len() as u64;
@@ -94,25 +96,29 @@ impl Storage for MemoryStorage {
     /// # 实现
     /// 如果超出当前大小，会自动扩展
     async fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
-        let mut storage = self.data.write().await;
-        let offset = offset as usize;
+        // 写入操作作用域：完成后自动释放写锁
+        let (bytes_written, new_size) = {
+            let mut storage = self.data.write().await;
+            let offset = offset as usize;
 
-        // 如果需要，扩展存储空间
-        let required_len = offset + data.len();
-        if storage.len() < required_len {
-            storage.resize(required_len, 0);
-        }
+            // 如果需要，扩展存储空间
+            let required_len = offset + data.len();
+            if storage.len() < required_len {
+                storage.resize(required_len, 0);
+            }
 
-        // 写入数据
-        storage[offset..offset + data.len()].copy_from_slice(data);
+            // 写入数据
+            storage[offset..offset + data.len()].copy_from_slice(data);
 
-        // 更新统计信息
-        drop(storage);
+            (data.len() as u64, storage.len() as u64)
+        }; // storage 在此自动释放
+
+        // 更新统计信息（数据锁已释放）
         {
             let mut stats = self.stats.write().await;
-            stats.bytes_written += data.len() as u64;
+            stats.bytes_written += bytes_written;
             stats.write_ops += 1;
-            stats.size = self.data.read().await.len() as u64;
+            stats.size = new_size;
         }
 
         Ok(())
@@ -123,17 +129,20 @@ impl Storage for MemoryStorage {
     /// # 实现
     /// 返回追加前的长度作为起始位置
     async fn append(&self, data: &[u8]) -> Result<u64> {
-        let mut storage = self.data.write().await;
-        let offset = storage.len() as u64;
-        storage.extend_from_slice(data);
+        // 追加操作作用域：完成后自动释放写锁
+        let (offset, bytes_written, new_size) = {
+            let mut storage = self.data.write().await;
+            let offset = storage.len() as u64;
+            storage.extend_from_slice(data);
+            (offset, data.len() as u64, storage.len() as u64)
+        }; // storage 在此自动释放
 
-        // 更新统计信息
-        drop(storage);
+        // 更新统计信息（数据锁已释放）
         {
             let mut stats = self.stats.write().await;
-            stats.bytes_written += data.len() as u64;
+            stats.bytes_written += bytes_written;
             stats.write_ops += 1;
-            stats.size = self.data.read().await.len() as u64;
+            stats.size = new_size;
         }
 
         Ok(offset)
@@ -149,29 +158,34 @@ impl Storage for MemoryStorage {
             return Ok(Vec::new());
         }
 
-        let mut storage = self.data.write().await;
-        let start_offset = storage.len() as u64;
+        // 批量追加操作作用域：完成后自动释放写锁
+        let (offsets, bytes_written, new_size) = {
+            let mut storage = self.data.write().await;
+            let start_offset = storage.len() as u64;
 
-        // 预先计算每条数据的起始位置
-        let mut offsets = Vec::with_capacity(data_list.len());
-        let mut current_offset = start_offset;
-        for data in data_list {
-            offsets.push(current_offset);
-            current_offset += data.len() as u64;
-        }
+            // 预先计算每条数据的起始位置
+            let mut offsets = Vec::with_capacity(data_list.len());
+            let mut current_offset = start_offset;
+            for data in data_list {
+                offsets.push(current_offset);
+                current_offset += data.len() as u64;
+            }
 
-        // 批量追加所有数据
-        for data in data_list {
-            storage.extend_from_slice(data);
-        }
+            // 批量追加所有数据
+            for data in data_list {
+                storage.extend_from_slice(data);
+            }
 
-        // 更新统计信息
-        drop(storage);
+            let bytes_written: u64 = data_list.iter().map(|d| d.len() as u64).sum();
+            (offsets, bytes_written, storage.len() as u64)
+        }; // storage 在此自动释放
+
+        // 更新统计信息（数据锁已释放）
         {
             let mut stats = self.stats.write().await;
-            stats.bytes_written += data_list.iter().map(|d| d.len() as u64).sum::<u64>();
+            stats.bytes_written += bytes_written;
             stats.write_ops += 1;
-            stats.size = self.data.read().await.len() as u64;
+            stats.size = new_size;
         }
 
         Ok(offsets)
@@ -229,14 +243,17 @@ impl Storage for MemoryStorage {
     /// # 实现
     /// 直接截断内部 Vec
     async fn truncate(&self, length: u64) -> Result<()> {
-        let mut storage = self.data.write().await;
-        storage.truncate(length as usize);
+        // 截断操作作用域：完成后自动释放写锁
+        let new_size = {
+            let mut storage = self.data.write().await;
+            storage.truncate(length as usize);
+            storage.len() as u64
+        }; // storage 在此自动释放
 
-        // 更新统计信息
-        drop(storage);
+        // 更新统计信息（数据锁已释放）
         {
             let mut stats = self.stats.write().await;
-            stats.size = self.data.read().await.len() as u64;
+            stats.size = new_size;
         }
 
         Ok(())
