@@ -6,21 +6,19 @@
 //! - Layer 4: API 层 - WalManager, WalBuilder
 
 mod commit_coordinator;
-mod coordinators;
+mod read_coordinator;
 mod recovery;
 mod segment_coordinator;
-mod sync_strategy;
 mod wal_manager;
 mod writer_handle;
 
 pub use commit_coordinator::{
-    CommitConfig, CommitCoordinator, CommitStats, SequenceNumber, WriteBatch, WriteMode, WriterId,
-    WriterMeta, WriterStats,
+    CommitConfig, CommitCoordinator, CommitStats, SequenceNumber, SyncPolicy, WriteBatch,
+    WriteMode, WriterId, WriterMeta, WriterStats,
 };
-pub use coordinators::{ReadCoordinator, WriteCoordinator};
+pub use read_coordinator::ReadCoordinator;
 pub use recovery::{Checkpoint, CheckpointPosition, RecoveryManager, RecoveryMode, RecoveryResult};
 pub use segment_coordinator::{ExtendedSegmentStats, RotationConfig, SegmentCoordinator};
-pub use sync_strategy::{SyncContext, SyncMode, SyncStats, SyncStrategy};
 pub use wal_manager::{Record, WalBuilder, WalConfig, WalManager};
 pub use writer_handle::WriterHandle;
 

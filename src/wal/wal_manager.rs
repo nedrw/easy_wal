@@ -7,8 +7,8 @@
 
 use super::{
     Checkpoint, CheckpointPosition, CommitConfig, CommitCoordinator, CommitStats, ReadCoordinator,
-    RecoveryManager, RecoveryMode, RecoveryResult, RotationConfig, SegmentCoordinator, SyncMode,
-    WriteMode, WriterHandle,
+    RecoveryManager, RecoveryMode, RecoveryResult, RotationConfig, SegmentCoordinator, WriteMode,
+    WriterHandle,
 };
 use crate::prelude::*;
 use crate::storage::{LogReader, LogReaderConfig, SegmentConfig, WritePosition};
@@ -22,8 +22,6 @@ pub struct WalConfig {
     pub dir: std::path::PathBuf,
     /// 最大段大小
     pub max_segment_size: u64,
-    /// 同步模式
-    pub sync_mode: SyncMode,
     /// 批量大小
     pub batch_size: usize,
     /// 预读缓冲区大小
@@ -37,7 +35,6 @@ impl Default for WalConfig {
         Self {
             dir: std::path::PathBuf::from("wal_data"),
             max_segment_size: 64 * 1024 * 1024, // 64MB
-            sync_mode: SyncMode::None,
             batch_size: 100,
             read_ahead_size: 64 * 1024, // 64KB
             commit_config: None,
@@ -56,12 +53,7 @@ impl WalConfig {
         self
     }
 
-    /// 设置同步模式
-    pub fn with_sync_mode(mut self, mode: SyncMode) -> Self {
-        self.sync_mode = mode;
-        self
-    }
-
+    /// 设置 Commit 配置
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.batch_size = size;
         self
@@ -100,8 +92,6 @@ pub struct WalManager {
     recovery_manager: RecoveryManager,
     /// 配置
     config: WalConfig,
-    /// 当前同步模式（用于运行时切换，向后兼容）
-    current_sync_mode: tokio::sync::RwLock<SyncMode>,
 }
 
 impl WalManager {
@@ -139,15 +129,11 @@ impl WalManager {
         // 创建恢复管理器（不变）
         let recovery_manager = RecoveryManager::new(&config.dir);
 
-        // 在移动 config 之前保存 sync_mode 的值
-        let initial_sync_mode = config.sync_mode;
-
         Ok(Self {
             commit_coordinator,
             read_coordinator,
             recovery_manager,
             config,
-            current_sync_mode: tokio::sync::RwLock::new(initial_sync_mode),
         })
     }
 
@@ -302,26 +288,8 @@ impl WalManager {
     // ============================================================
 
     /// 获取当前同步模式（向后兼容，实际由 CommitConfig 控制）
-    ///
-    /// 注意：CommitCoordinator 使用 CommitConfig 控制行为，
-    /// 此方法返回运行时的 sync_mode，但不直接影响 CommitCoordinator 的行为。
-    pub async fn sync_mode(&self) -> SyncMode {
-        self.current_sync_mode.read().await.clone()
-    }
-
-    /// 设置同步模式（向后兼容，但不推荐使用）
-    ///
-    /// 注意：此方法仅更新运行时的 sync_mode 值，不影响 CommitCoordinator 的行为。
-    /// 建议使用 `with_commit_config()` 配置 CommitCoordinator。
-    pub async fn set_sync_mode(&self, mode: SyncMode) {
-        // 更新运行时的 sync_mode（向后兼容）
-        *self.current_sync_mode.write().await = mode;
-        tracing::warn!("set_sync_mode is deprecated. Use commit_config instead.");
-    }
-
-    /// 获取同步统计信息（向后兼容）
-    ///
-    /// 返回 CommitStats，而不是 SyncStats。
+    /// 获取同步统计信息
+    /// 返回 CommitStats（包含批次统计信息）
     pub async fn sync_stats(&self) -> CommitStats {
         self.commit_coordinator.stats().await
     }
@@ -346,11 +314,6 @@ impl WalBuilder {
 
     pub fn with_max_segment_size(mut self, size: u64) -> Self {
         self.config.max_segment_size = size;
-        self
-    }
-
-    pub fn with_sync_mode(mut self, mode: SyncMode) -> Self {
-        self.config = self.config.with_sync_mode(mode);
         self
     }
 

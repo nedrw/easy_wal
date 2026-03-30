@@ -7,7 +7,7 @@
 //! - 检查点创建/加载/删除流程测试
 //! - 不同 SyncMode 的性能对比测试
 
-use easy_wal::{RecoveryMode, SyncMode, WalBuilder};
+use easy_wal::{CommitConfig, RecoveryMode, SyncPolicy, WalBuilder};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -22,7 +22,6 @@ async fn test_wal_manager_full_lifecycle() {
     // 1. 创建 WAL
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .with_max_segment_size(1024)
         .build()
         .await
@@ -46,7 +45,6 @@ async fn test_wal_manager_full_lifecycle() {
     // 5. 重新打开并验证数据存在
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -78,7 +76,6 @@ async fn test_wal_manager_crash_recovery() {
     {
         let wal = WalBuilder::new()
             .with_dir(temp_dir.path())
-            .with_sync_mode(SyncMode::FsyncOnWrite)
             .build()
             .await
             .unwrap();
@@ -91,7 +88,6 @@ async fn test_wal_manager_crash_recovery() {
     // 2. 重新打开，验证数据可恢复
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -119,7 +115,6 @@ async fn test_wal_manager_segment_rotation_with_recovery() {
     // 使用小段大小触发轮转
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .with_max_segment_size(50) // 小段大小
         .build()
         .await
@@ -143,7 +138,6 @@ async fn test_wal_manager_segment_rotation_with_recovery() {
     // 恢复后验证
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -168,7 +162,6 @@ async fn test_recovery_normal_case() {
     // 正常创建、写入、关闭
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -180,7 +173,6 @@ async fn test_recovery_normal_case() {
     // 重新打开并验证数据完整性
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -207,7 +199,6 @@ async fn test_recovery_with_checkpoint() {
 
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -223,7 +214,6 @@ async fn test_recovery_with_checkpoint() {
     // 使用检查点恢复
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -252,7 +242,6 @@ async fn test_recovery_mode_full_scan() {
 
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -266,7 +255,6 @@ async fn test_recovery_mode_full_scan() {
     // 重新打开验证数据
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -289,7 +277,6 @@ async fn test_recovery_mode_incremental() {
 
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -303,7 +290,6 @@ async fn test_recovery_mode_incremental() {
     // 使用检查点恢复
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -325,7 +311,6 @@ async fn test_recovery_mode_verify_only() {
 
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -336,7 +321,6 @@ async fn test_recovery_mode_verify_only() {
     // VerifyOnly 模式只验证不恢复
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -364,7 +348,6 @@ async fn test_checkpoint_create_and_load() {
 
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -385,7 +368,6 @@ async fn test_checkpoint_create_and_load() {
     // 重新加载检查点
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -405,7 +387,6 @@ async fn test_checkpoint_delete() {
 
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -424,7 +405,6 @@ async fn test_checkpoint_delete() {
     // 重新打开，验证没有检查点时会正常处理
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -443,7 +423,6 @@ async fn test_checkpoint_sequential_writes() {
 
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -483,7 +462,6 @@ async fn test_write_read_coordinator_collaboration() {
 
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -517,7 +495,6 @@ async fn test_batch_write_read_coordinator() {
 
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -551,7 +528,6 @@ async fn test_seek_and_continue_writing() {
 
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -584,172 +560,6 @@ async fn test_seek_and_continue_writing() {
 }
 
 // ============================================================================
-// 不同 SyncMode 的性能对比测试
-// ============================================================================
-
-#[tokio::test]
-async fn test_sync_mode_none_performance() {
-    let temp_dir = tempdir().unwrap();
-
-    let wal = WalBuilder::new()
-        .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::None)
-        .build()
-        .await
-        .unwrap();
-
-    let start = std::time::Instant::now();
-
-    for i in 0..100 {
-        wal.write(format!("data{}", i).as_bytes()).await.unwrap();
-    }
-
-    let duration = start.elapsed();
-
-    // SyncMode::None 应该很快
-    assert!(
-        duration < std::time::Duration::from_secs(5),
-        "None 模式应该很快"
-    );
-
-    // 获取统计信息（CommitCoordinator 使用 CommitStats）
-    let stats = wal.sync_stats().await;
-    assert!(stats.total_batches > 0, "应该有批次被提交");
-    assert_eq!(stats.total_records, 100, "应该有100条记录");
-
-    wal.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_sync_mode_fsync_on_write() {
-    let temp_dir = tempdir().unwrap();
-
-    let wal = WalBuilder::new()
-        .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
-        .build()
-        .await
-        .unwrap();
-
-    for i in 0..50 {
-        wal.write(format!("data{}", i).as_bytes()).await.unwrap();
-    }
-
-    // CommitCoordinator 单写模式下，每次写入都直接提交
-    // 注意：虽然配置了 FsyncOnWrite，但 CommitCoordinator 使用 CommitConfig 控制行为
-    let stats = wal.sync_stats().await;
-    assert!(stats.total_batches > 0, "应该有批次被提交");
-    assert_eq!(stats.total_records, 50, "应该有50条记录");
-
-    // 验证数据完整性
-    wal.seek_to_start().await;
-    let records = wal.read_batch(100).await.unwrap();
-    assert_eq!(records.len(), 50);
-
-    wal.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_sync_mode_batch() {
-    let temp_dir = tempdir().unwrap();
-
-    let wal = WalBuilder::new()
-        .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::Batch { batch_size: 10 })
-        .build()
-        .await
-        .unwrap();
-
-    for i in 0..50 {
-        wal.write(format!("data{}", i).as_bytes()).await.unwrap();
-    }
-
-    // CommitCoordinator 单写模式下，每次写入都直接提交
-    // 调用 flush 触发提交循环（如果有待处理的批次）
-    wal.flush().await.unwrap();
-
-    let stats = wal.sync_stats().await;
-    // CommitCoordinator 使用 total_batches 和 total_records 统计
-    assert!(stats.total_batches > 0, "应该有批次被提交");
-    assert_eq!(stats.total_records, 50, "应该有50条记录");
-
-    wal.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_sync_mode_periodic() {
-    let temp_dir = tempdir().unwrap();
-
-    // 注意：CommitCoordinator 不支持周期同步模式，使用 CommitConfig 控制行为
-    let wal = WalBuilder::new()
-        .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::Periodic { interval_ms: 100 })
-        .build()
-        .await
-        .unwrap();
-
-    for i in 0..20 {
-        wal.write(format!("data{}", i).as_bytes()).await.unwrap();
-    }
-
-    // 等待一小段时间，让 commit loop 处理完成
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    // 调用 flush 触发提交
-    wal.flush().await.unwrap();
-
-    let stats = wal.sync_stats().await;
-    // 检查 total_batches 和 total_records
-    assert!(stats.total_batches > 0, "应该有批次被提交");
-    assert_eq!(stats.total_records, 20, "应该有20条记录");
-
-    wal.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_sync_mode_runtime_switch() {
-    let temp_dir = tempdir().unwrap();
-
-    let wal = WalBuilder::new()
-        .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::None)
-        .build()
-        .await
-        .unwrap();
-
-    // 注意：CommitCoordinator 不直接支持 SyncMode 的运行时切换
-    // sync_mode() 和 set_sync_mode() 方法仅为向后兼容保留
-
-    // 初始：None 模式（配置值）
-    assert_eq!(wal.sync_mode().await, SyncMode::None);
-
-    wal.write(b"data1").await.unwrap();
-    let stats1 = wal.sync_stats().await;
-    // CommitCoordinator 单写模式下，每次写入都直接提交
-    assert!(stats1.total_batches > 0, "应该有批次被提交");
-    assert_eq!(stats1.total_records, 1, "应该有1条记录");
-
-    // 切换到 FsyncOnWrite（配置值，不影响 CommitCoordinator 行为）
-    wal.set_sync_mode(SyncMode::FsyncOnWrite).await;
-    assert_eq!(wal.sync_mode().await, SyncMode::FsyncOnWrite);
-
-    wal.write(b"data2").await.unwrap();
-    let stats2 = wal.sync_stats().await;
-    // CommitCoordinator 行为不变，仍然是单写模式直接提交
-    assert!(
-        stats2.total_batches > stats1.total_batches,
-        "应该有更多批次"
-    );
-    assert_eq!(stats2.total_records, 2, "应该有2条记录");
-
-    // 切换到 Batch 模式（配置值，不影响 CommitCoordinator 行为）
-    wal.set_sync_mode(SyncMode::Batch { batch_size: 5 }).await;
-    assert_eq!(wal.sync_mode().await, SyncMode::Batch { batch_size: 5 });
-
-    wal.close().await.unwrap();
-}
-
-// ============================================================================
 // 边界情况和错误处理测试
 // ============================================================================
 
@@ -760,7 +570,6 @@ async fn test_empty_wal_recovery() {
     // 创建空 WAL
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -770,7 +579,6 @@ async fn test_empty_wal_recovery() {
     // 恢复空 WAL
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -789,7 +597,6 @@ async fn test_single_record_crash_recovery() {
     {
         let wal = WalBuilder::new()
             .with_dir(temp_dir.path())
-            .with_sync_mode(SyncMode::FsyncOnWrite)
             .build()
             .await
             .unwrap();
@@ -801,7 +608,6 @@ async fn test_single_record_crash_recovery() {
     // 恢复
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -820,7 +626,6 @@ async fn test_large_record_batch() {
 
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .with_max_segment_size(1024 * 1024) // 1MB 段大小
         .build()
         .await
@@ -846,7 +651,6 @@ async fn test_concurrent_write_and_read() {
     let wal = Arc::new(
         WalBuilder::new()
             .with_dir(temp_dir.path())
-            .with_sync_mode(SyncMode::FsyncOnWrite)
             .build()
             .await
             .unwrap(),
@@ -882,7 +686,6 @@ async fn test_reopen_and_read_existing_data() {
     // 第一次写入
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -893,7 +696,6 @@ async fn test_reopen_and_read_existing_data() {
     // 第二次打开同一目录
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -905,7 +707,6 @@ async fn test_reopen_and_read_existing_data() {
     // 第三次打开验证所有数据
     let wal3 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -926,7 +727,6 @@ async fn test_position_tracking() {
 
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();
@@ -957,7 +757,6 @@ async fn test_multi_segment_scan_after_recovery() {
     // 使用非常小的段大小强制轮转
     let wal = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .with_max_segment_size(100)
         .build()
         .await
@@ -976,7 +775,6 @@ async fn test_multi_segment_scan_after_recovery() {
     // 重新打开验证所有段数据
     let wal2 = WalBuilder::new()
         .with_dir(temp_dir.path())
-        .with_sync_mode(SyncMode::FsyncOnWrite)
         .build()
         .await
         .unwrap();

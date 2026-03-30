@@ -16,9 +16,28 @@ use tracing::{error, info};
 
 // ===================== Core Types =====================
 
+/// 同步策略
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPolicy {
+    /// 每次写入后同步（最安全，性能最低）
+    Always,
+    /// 批量写入后同步（在性能和安全之间平衡）
+    OnCommit,
+    /// 不同步（依赖操作系统缓冲，性能最高但风险最大）
+    None,
+}
+
+impl Default for SyncPolicy {
+    fn default() -> Self {
+        SyncPolicy::OnCommit // 默认：批量同步，平衡性能和安全
+    }
+}
+
 /// Group Commit 配置
 #[derive(Debug, Clone)]
 pub struct CommitConfig {
+    /// 同步策略
+    pub sync_policy: SyncPolicy,
     /// 最大批次大小（字节），达到此值强制提交
     pub max_batch_size: usize,
     /// 最大等待时间（毫秒），达到此时间强制提交
@@ -33,10 +52,11 @@ impl CommitConfig {
     /// 创建默认配置
     pub fn new() -> Self {
         Self {
+            sync_policy: SyncPolicy::default(),
             max_batch_size: 64 * 1024, // 64KB
             max_wait_time_ms: 5,       // 5ms
             max_batch_count: 100,      // 100 batches
-            min_batches_for_commit: 1, // 单个批次也可提交
+            min_batches_for_commit: 1, // Can commit with single batch
         }
     }
 }
@@ -507,10 +527,12 @@ impl CommitCoordinator {
             }
         };
 
-        // 同步
-        if let Err(e) = writer.sync().await {
-            batch.send_result(Err(e));
-            return;
+        // 同步（根据策略）
+        if self.config.sync_policy == SyncPolicy::Always {
+            if let Err(e) = writer.sync().await {
+                batch.send_result(Err(e));
+                return;
+            }
         }
 
         // 更新段大小
@@ -643,8 +665,10 @@ impl CommitCoordinator {
             pos_index += count;
         }
 
-        // 同步到磁盘
-        writer.sync().await?;
+        // 同步到磁盘（根据策略）
+        if self.config.sync_policy != SyncPolicy::None {
+            writer.sync().await?;
+        }
 
         // 检查段轮转
         let header_size = 12u64; // record header size
