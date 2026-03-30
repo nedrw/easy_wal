@@ -307,6 +307,139 @@ while offset + RECORD_HEADER_SIZE <= file_size {
 
 ---
 
+## 问题 #4: 段管理器实例不共享
+
+**状态**: ⚠️ 未修复  
+**严重程度**: 中（架构缺陷）  
+**影响版本**: v0.1.0  
+**发现日期**: 2026-03-31  
+
+---
+
+### 问题描述
+
+WriteCoordinator 和 ReadCoordinator 使用两个独立的 SegmentManager 实例，状态不同步。
+
+**症状**:
+- 写入时创建新段，SegmentManager 实例 #1 更新
+- ReadCoordinator 的 SegmentManager 实例 #2 不知道新段
+- 可能导致无法访问新创建的段文件
+
+---
+
+### 根因分析
+
+当前架构设计缺陷：
+
+```
+WalManager
+├── WriteCoordinator
+│   └── SegmentCoordinator (Arc 共享)
+│       └── SegmentManager 实例 #1  ← 写入时更新
+│
+└── ReadCoordinator
+    └── LogReader (独立创建)
+        └── SegmentManager 实例 #2  ← 状态不同步
+```
+
+**WalManager::new() 的创建流程**:
+
+```rust
+// 1. 创建共享的 SegmentCoordinator
+let segment_coordinator = Arc::new(SegmentCoordinator::new(...).await?);
+//    ↑ SegmentManager 实例 #1 在这里创建
+
+// 2. WriteCoordinator 使用共享引用
+let write_coordinator = WriteCoordinator::new(segment_coordinator.clone(), ...);
+
+// 3. LogReader 独立创建，有自己的 SegmentManager
+let reader = LogReader::new(reader_config).await?;
+//           ↑ SegmentManager 实例 #2 在这里创建（独立）
+```
+
+---
+
+### 为什么当前修复仍然成功？
+
+虽然 SegmentManager 不共享，但本次修复（方案 C+）绕过了这个问题：
+
+1. **ReadCoordinator 独立维护位置**:
+   - `consume_position` 和 `read_ahead_position` 完全独立
+   - 不依赖 LogReader 的 SegmentManager 状态
+
+2. **LogReader 直接访问段文件**:
+   - `get_storage_for_segment()` 直接根据段 ID 打开文件
+   - 不检查 `segment_manager.active_id()`
+   - 绕过了段元数据依赖
+
+3. **添加了 `read_raw_at()` 方法**:
+   - 支持指定位置读取，不需要段管理器状态
+
+**但这不是根本解决方案**。如果未来需要依赖 SegmentManager 的其他功能（如段统计、清理、列表查询），问题会再次出现。
+
+---
+
+### 修复方案（待实施）
+
+#### 方案 A: 让 LogReader 使用共享的 SegmentCoordinator（推荐）
+
+**设计**:
+
+```rust
+// 修改 WalManager::new()
+let segment_coordinator = Arc::new(SegmentCoordinator::new(...).await?);
+
+let write_coordinator = WriteCoordinator::new(segment_coordinator.clone(), ...);
+
+// ✅ 让 LogReader 也使用共享的 SegmentCoordinator
+let reader = LogReader::with_segment_coordinator(segment_coordinator.clone()).await?;
+```
+
+**优点**:
+- 真正解决状态同步问题
+- 减少资源占用（只有一个 SegmentManager）
+- 架构更清晰
+
+**缺点**:
+- 需要修改 LogReader 的构造方法
+- 需要处理并发访问（但已有 RwLock）
+
+**工作量**: 1-2 天
+
+#### 方案 B: 定期同步两个 SegmentManager 的状态
+
+**设计**:
+- 保持当前架构，但添加同步机制
+- WriteCoordinator 在创建新段时，通知 LogReader 重新扫描
+
+**优点**:
+- 改动较小
+- 不破坏现有架构
+
+**缺点**:
+- 不是根本解决方案
+- 仍然存在状态延迟
+
+**工作量**: 0.5-1 天
+
+---
+
+### 修复优先级
+
+| 优先级 | 任务 | 预计工作量 |
+|--------|------|-----------|
+| P2 | 方案 A: LogReader 使用共享 SegmentCoordinator | 1-2 天 |
+| P3 | 方案 B: 添加同步机制 | 0.5-1 天 |
+
+---
+
+### 相关测试
+
+- 所有读写测试受潜在影响
+- 但当前通过 `read_raw_at()` 和直接文件访问绕过了问题
+
+---
+
 ## 后续优化事项
 
 ### 优化 #1: fill() 方法改进
@@ -409,3 +542,4 @@ while offset + RECORD_HEADER_SIZE <= file_size {
 - 2026-03-31: **发现并修复 checkpoint 创建问题**（问题 #2）
 - 2026-03-31: **发现 RecoveryManager 性能问题**（问题 #3），待优化
 - 2026-03-31: 记录后续优化事项（优化 #1-#4）
+- 2026-03-31: **发现段管理器实例不共享问题**（问题 #4），待重构
