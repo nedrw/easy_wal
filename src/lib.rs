@@ -36,6 +36,6 @@ pub use storage::{
 // WAL 层导出（协调层 + API 层）
 pub use wal::{
     Checkpoint, CheckpointPosition, CommitConfig, CommitCoordinator, CommitStats, ReadCoordinator,
-    RecoveryManager, RecoveryMode, RecoveryResult, SyncPolicy, WalBuilder, WalConfig, WalManager,
+    RecoveryManager, RecoveryMode, RecoveryResult, SyncPolicy, WalBuilder, WalConfig, WalManager, WriteMode,
     WriterHandle,
 };

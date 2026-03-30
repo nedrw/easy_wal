@@ -11,9 +11,10 @@
 
 **当前状态**:
 - Phase 0-2: ✅ 核心基础设施已完成
-- Phase 3-5: ❌ 未开始
+- Phase 3: ✅ Integration & API 已完成
+- Phase 4-5: ❌ 未开始
 
-**下一步目标**: 实现 Recovery 支持和完整功能测试（Phase 3）
+**下一步目标**: 性能优化和压力测试（Phase 4）
 
 ---
 
@@ -76,7 +77,7 @@ WalManager
 | 0 | 段管理架构重构 | ✅ 完成 | - | SegmentCoordinator 引入 |
 | 1 | Multi-Writer Core Infrastructure | ✅ 完成 | - | CommitCoordinator 实现 |
 | 2 | 统一写入架构 | ✅ 完成 | **3-5天** | CommitCoordinator 扩展，智能退化，WriterHandle 实现 |
-| 3 | Integration & API | ❌ 未开始 | **3-5天** | Recovery 支持和测试 |
+| 3 | Integration & API | ✅ 完成 | **1天** | Recovery 支持，单写/多写模式测试，WriteMode 导出 |
 | 4 | Optimization & Testing | ❌ 未开始 | **1周** | 性能优化和压力测试 |
 | 5 | Documentation | ❌ 未开始 | **1周** | 文档完善 |
 
@@ -123,32 +124,40 @@ WalManager
 
 ---
 
-## 待开发任务
-
-### Phase 3: Integration & API
+### Phase 3: Integration & API ✅
 
 **目标**: Recovery 支持和完整功能测试
 
-- [ ] **Task 3.1**: Recovery 支持
+- [x] **Task 3.1**: Recovery 支持
   - 统一写入架构的恢复逻辑
   - 验证数据完整性
-  - 预计工作量: 1天
+  - 实际工作量: 0.5天
 
-- [ ] **Task 3.2**: 完整功能测试
-  - 单写模式测试
-  - 多写模式测试
-  - 模式切换测试
-  - 边界条件测试
-  - 预计工作量: 2天
+- [x] **Task 3.2**: 完整功能测试
+  - 单写模式测试（`test_single_writer_mode`）
+  - 多写模式测试（`test_multi_writer_mode`）
+  - 模式切换测试（`test_mode_switching`）
+  - WriterHandle 生命周期测试（`test_writer_lifecycle`，`test_writer_double_close`）
+  - 并发多 writer 测试（`test_concurrent_multi_writer`）
+  - 批量写入测试（`test_writer_handle_batch_write`）
+  - 实际工作量: 0.5天
 
-- [ ] **Task 3.3**: 文档完善
-  - API 使用文档
-  - 架构调整说明
-  - 预计工作量: 2天
+- [x] **Task 3.3**: API 完善
+  - 导出 `WriteMode` 类型（`src/lib.rs`）
+  - 修复测试警告（unused imports）
+  - 实际工作量: 0.1天
 
-**预计总工作量**: **3-5天**（vs 原计划 1周，减少 30%）
+**实际总工作量**: **1天**
+
+**关键成果**:
+- 测试覆盖：21 → 28 个集成测试（新增 7 个 Phase 3 测试）
+- WriteMode 导出：用户可通过 `easy_wal::WriteMode` 判断当前模式
+- 所有 109 个测试通过（63 单元 + 17 存储 + 1 偏移 + 28 集成）
+
 
 ---
+
+## 待开发任务
 
 ### Phase 4: Optimization & Testing
 

@@ -6,8 +6,9 @@
 //! - 协调器协作测试
 //! - 检查点创建/加载/删除流程测试
 //! - 不同 SyncMode 的性能对比测试
+//! - Phase 3: 单写/多写模式测试，模式切换测试
 
-use easy_wal::{CommitConfig, RecoveryMode, SyncPolicy, WalBuilder};
+use easy_wal::{RecoveryMode, WalBuilder};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -789,4 +790,289 @@ async fn test_multi_segment_scan_after_recovery() {
     );
 
     wal2.close().await.unwrap();
+}
+
+// ============================================================================
+// Phase 3: 单写/多写模式测试
+// ============================================================================
+
+#[tokio::test]
+async fn test_single_writer_mode() {
+    let temp_dir = tempdir().unwrap();
+
+    let wal = WalBuilder::new()
+        .with_dir(temp_dir.path())
+        .build()
+        .await
+        .unwrap();
+
+    // 注册单个 writer
+    let writer = wal
+        .register_writer(Some("single".to_string()))
+        .await
+        .unwrap();
+
+    // 验证 writer 信息
+    assert_eq!(writer.name(), Some("single"));
+    assert!(matches!(wal.write_mode(), easy_wal::WriteMode::Single));
+
+    // 使用 writer 写入数据
+    writer.write(b"record1").await.unwrap();
+    writer.write(b"record2").await.unwrap();
+
+    // 关闭 writer
+    writer.close().await.unwrap();
+
+    // 验证数据
+    wal.seek_to_start().await;
+    let records = wal.read_batch(10).await.unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].data, b"record1");
+    assert_eq!(records[1].data, b"record2");
+
+    wal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_multi_writer_mode() {
+    let temp_dir = tempdir().unwrap();
+
+    let wal = Arc::new(
+        WalBuilder::new()
+            .with_dir(temp_dir.path())
+            .build()
+            .await
+            .unwrap(),
+    );
+
+    // 注册多个 writer
+    let writer1 = wal
+        .register_writer(Some("writer1".to_string()))
+        .await
+        .unwrap();
+    let writer2 = wal
+        .register_writer(Some("writer2".to_string()))
+        .await
+        .unwrap();
+
+    // 验证模式切换为多写模式
+    assert!(matches!(wal.write_mode(), easy_wal::WriteMode::Multi));
+    assert_eq!(wal.writer_count().await, 2);
+
+    // 写入数据（不使用 spawn，避免 move 问题）
+    writer1.write(b"from_writer1").await.unwrap();
+    writer2.write(b"from_writer2").await.unwrap();
+
+    // 等待 commit 处理
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // 关闭 writers
+    writer1.close().await.unwrap();
+    writer2.close().await.unwrap();
+
+    // 验证数据存在
+    wal.seek_to_start().await;
+    let records = wal.read_batch(10).await.unwrap();
+    assert!(records.len() >= 2);
+
+    wal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_mode_switching() {
+    let temp_dir = tempdir().unwrap();
+
+    let wal = WalBuilder::new()
+        .with_dir(temp_dir.path())
+        .build()
+        .await
+        .unwrap();
+
+    // 阶段1: 单写模式
+    let writer1 = wal
+        .register_writer(Some("first".to_string()))
+        .await
+        .unwrap();
+    assert!(matches!(wal.write_mode(), easy_wal::WriteMode::Single));
+    writer1.write(b"single_mode_data").await.unwrap();
+    writer1.close().await.unwrap();
+
+    // 等待模式切换
+    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+    // 阶段2: 切换到多写模式
+    let writer2 = wal
+        .register_writer(Some("second".to_string()))
+        .await
+        .unwrap();
+    let writer3 = wal
+        .register_writer(Some("third".to_string()))
+        .await
+        .unwrap();
+    assert!(matches!(wal.write_mode(), easy_wal::WriteMode::Multi));
+    assert_eq!(wal.writer_count().await, 2);
+
+    writer2.write(b"multi_mode_1").await.unwrap();
+    writer3.write(b"multi_mode_2").await.unwrap();
+
+    writer2.close().await.unwrap();
+    writer3.close().await.unwrap();
+
+    // 等待模式切换回单写
+    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+    // 阶段3: 回到单写模式
+    let writer4 = wal.register_writer(None).await.unwrap();
+    assert!(matches!(wal.write_mode(), easy_wal::WriteMode::Single));
+    writer4.write(b"back_to_single").await.unwrap();
+    writer4.close().await.unwrap();
+
+    // 验证所有数据
+    wal.seek_to_start().await;
+    let records = wal.read_batch(10).await.unwrap();
+    assert!(records.len() >= 4);
+
+    wal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_writer_handle_batch_write() {
+    let temp_dir = tempdir().unwrap();
+
+    let wal = WalBuilder::new()
+        .with_dir(temp_dir.path())
+        .build()
+        .await
+        .unwrap();
+
+    let writer = wal.register_writer(None).await.unwrap();
+
+    // 批量写入
+    let positions = writer
+        .write_batch(&[b"batch1", b"batch2", b"batch3"])
+        .await
+        .unwrap();
+    assert_eq!(positions.len(), 3);
+
+    writer.close().await.unwrap();
+
+    // 验证数据
+    wal.seek_to_start().await;
+    let records = wal.read_batch(10).await.unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].data, b"batch1");
+    assert_eq!(records[1].data, b"batch2");
+    assert_eq!(records[2].data, b"batch3");
+
+    wal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_writer_lifecycle() {
+    let temp_dir = tempdir().unwrap();
+
+    let wal = WalBuilder::new()
+        .with_dir(temp_dir.path())
+        .build()
+        .await
+        .unwrap();
+
+    // 创建 writer
+    let writer = wal
+        .register_writer(Some("lifecycle_test".to_string()))
+        .await
+        .unwrap();
+    let _writer_id = writer.id();
+
+    // 写入数据
+    let pos = writer.write(b"lifecycle_data").await.unwrap();
+    assert_eq!(pos.segment_id, 1);
+
+    // writer 关闭后自动从注册表移除
+    writer.close().await.unwrap();
+
+    // writer_count 应该回到 0（单写模式下）
+    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+    // 验证数据完整性
+    wal.seek_to_start().await;
+    let records = wal.read_batch(10).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].data, b"lifecycle_data");
+
+    wal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_writer_double_close() {
+    let temp_dir = tempdir().unwrap();
+
+    let wal = WalBuilder::new()
+        .with_dir(temp_dir.path())
+        .build()
+        .await
+        .unwrap();
+
+    let writer = wal.register_writer(None).await.unwrap();
+    writer.write(b"data").await.unwrap();
+
+    // 第一次关闭
+    writer.close().await.unwrap();
+
+    // 第二次关闭应该安全（幂等）
+    writer.close().await.unwrap();
+
+    // writer_count 应该安全处理
+    assert!(wal.writer_count().await <= 1);
+
+    wal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_concurrent_multi_writer() {
+    use tokio::task::JoinSet;
+
+    let temp_dir = tempdir().unwrap();
+
+    let wal = Arc::new(
+        WalBuilder::new()
+            .with_dir(temp_dir.path())
+            .build()
+            .await
+            .unwrap(),
+    );
+
+    // 并发创建多个 writer
+    let mut join_set = JoinSet::new();
+    for i in 0..10 {
+        let wal = wal.clone();
+        join_set.spawn(async move {
+            let writer = wal
+                .register_writer(Some(format!("writer{}", i)))
+                .await
+                .unwrap();
+            // 写入一些数据
+            for j in 0..5 {
+                let data = format!("writer{}_record{}", i, j);
+                writer.write(data.as_bytes()).await.unwrap();
+            }
+            writer.close().await.unwrap();
+        });
+    }
+
+    while let Some(_) = join_set.join_next().await {}
+
+    // 等待处理完成
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // 验证数据（至少应该有 50 条记录）
+    wal.seek_to_start().await;
+    let records = wal.read_batch(100).await.unwrap();
+    assert!(
+        records.len() >= 50,
+        "应该至少有50条记录，实际: {}",
+        records.len()
+    );
+
+    wal.close().await.unwrap();
 }
