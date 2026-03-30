@@ -349,7 +349,6 @@ mod tests {
 
         let wal = WalBuilder::new()
             .with_dir(temp_dir.path())
-            .with_sync_mode(SyncMode::FsyncOnWrite)
             .build()
             .await
             .unwrap();
@@ -374,7 +373,6 @@ mod tests {
 
         let wal = WalBuilder::new()
             .with_dir(temp_dir.path())
-            .with_sync_mode(SyncMode::FsyncOnWrite)
             .build()
             .await
             .unwrap();
@@ -401,7 +399,6 @@ mod tests {
 
         let wal = WalBuilder::new()
             .with_dir(temp_dir.path())
-            .with_sync_mode(SyncMode::FsyncOnWrite)
             .build()
             .await
             .unwrap();
@@ -425,7 +422,6 @@ mod tests {
         let wal = WalBuilder::new()
             .with_dir(temp_dir.path())
             .with_max_segment_size(10)
-            .with_sync_mode(SyncMode::FsyncOnWrite)
             .build()
             .await
             .unwrap();

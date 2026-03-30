@@ -272,14 +272,6 @@ mod tests {
     use tempfile::tempdir;
 
     /// 辅助函数：创建测试用的写入器和写入数据
-    async fn create_test_writer(dir: &std::path::Path) -> Arc<RwLock<LogWriter>> {
-        let segment_config = SegmentConfig::new(dir);
-        let writer = LogWriter::new(LogWriterConfig::default(), segment_config)
-            .await
-            .unwrap();
-        Arc::new(RwLock::new(writer))
-    }
-
     #[tokio::test]
     async fn test_read_coordinator_basic() {
         let temp_dir = tempdir().unwrap();
