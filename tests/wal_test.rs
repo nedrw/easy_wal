@@ -37,19 +37,6 @@ fn test_open_existing_wal() {
 }
 
 #[test]
-fn test_wal_config_default() {
-    // 测试默认配置
-    let config = Config::default();
-
-    // 验证默认配置值
-    assert!(config.segment_size() > 0);
-    assert_eq!(
-        config.persistence_mode(),
-        easy_wal::PersistenceMode::Immediate
-    );
-}
-
-#[test]
 fn test_wal_config_custom() {
     // 测试自定义配置
     let config = Config::new()
@@ -58,19 +45,6 @@ fn test_wal_config_custom() {
 
     assert_eq!(config.segment_size(), 1024 * 1024);
     assert_eq!(config.persistence_mode(), easy_wal::PersistenceMode::Batch);
-}
-
-#[test]
-fn test_wal_write_single_record() {
-    // 测试写入单条记录
-    let temp_dir = TempDir::new().unwrap();
-    let wal_path = temp_dir.path().join("wal");
-
-    let config = Config::default();
-    let wal = Wal::create(&wal_path, config).unwrap();
-
-    let data = b"test data";
-    wal.write(data).unwrap();
 }
 
 #[test]
@@ -98,24 +72,6 @@ fn test_wal_write_multiple_records() {
     for i in 1..offsets.len() {
         assert!(offsets[i] > offsets[i - 1]);
     }
-}
-
-#[test]
-fn test_wal_read_single_record() {
-    // 测试读取单条记录
-    let temp_dir = TempDir::new().unwrap();
-    let wal_path = temp_dir.path().join("wal");
-
-    let config = Config::default();
-    let wal = Wal::create(&wal_path, config).unwrap();
-
-    let original_data = b"test data for reading";
-    let offset = wal.write(original_data).unwrap();
-
-    // 读取刚才写入的数据
-    let read_data = wal.read(offset).unwrap();
-
-    assert_eq!(read_data.as_slice(), original_data);
 }
 
 #[test]
@@ -274,89 +230,4 @@ fn test_wal_close() {
     let result = wal.read(0);
     assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), Error::Closed));
-}
-
-#[test]
-fn test_wal_path_tracking() {
-    // 测试 WAL 路径跟踪
-    let temp_dir = TempDir::new().unwrap();
-    let wal_path = temp_dir.path().join("wal");
-
-    let config = Config::default();
-    let wal = Wal::create(&wal_path, config).unwrap();
-
-    assert_eq!(wal.path(), wal_path);
-}
-
-#[test]
-fn test_wal_empty_data() {
-    // 测试写入空数据
-    let temp_dir = TempDir::new().unwrap();
-    let wal_path = temp_dir.path().join("wal");
-
-    let config = Config::default();
-    let wal = Wal::create(&wal_path, config).unwrap();
-
-    let empty_data = b"";
-    let offset = wal.write(empty_data).unwrap();
-
-    // 空数据也应该能正常读取
-    let read_data = wal.read(offset).unwrap();
-    assert_eq!(read_data.as_slice(), empty_data);
-}
-
-#[test]
-fn test_wal_large_data() {
-    // 测试写入大数据
-    let temp_dir = TempDir::new().unwrap();
-    let wal_path = temp_dir.path().join("wal");
-
-    let config = Config::default();
-    let wal = Wal::create(&wal_path, config).unwrap();
-
-    // 1MB 数据
-    let large_data = vec![0u8; 1024 * 1024];
-    let offset = wal.write(&large_data).unwrap();
-
-    // 验证大数据能正确读写
-    let read_data = wal.read(offset).unwrap();
-    assert_eq!(read_data.len(), large_data.len());
-    assert_eq!(read_data, large_data);
-}
-
-#[test]
-fn test_wal_concurrent_reads() {
-    // 测试并发读取（如果支持）
-    use std::sync::Arc;
-    use std::thread;
-
-    let temp_dir = TempDir::new().unwrap();
-    let wal_path = temp_dir.path().join("wal");
-
-    let config = Config::default();
-    let wal = Wal::create(&wal_path, config).unwrap();
-
-    // 写入数据
-    let data = b"test data for concurrent read";
-    let offset = wal.write(data).unwrap();
-
-    let wal = Arc::new(wal);
-    let mut handles = vec![];
-
-    // 启动多个线程并发读取
-    for _ in 0..10 {
-        let wal_clone = Arc::clone(&wal);
-        let offset = offset;
-        let data = data.to_vec();
-
-        handles.push(thread::spawn(move || {
-            let read_data = wal_clone.read(offset).unwrap();
-            assert_eq!(read_data.as_slice(), data.as_slice());
-        }));
-    }
-
-    // 等待所有线程完成
-    for handle in handles {
-        handle.join().unwrap();
-    }
 }

@@ -1,85 +1,18 @@
 //! 错误类型测试
 //!
-//! 测试 Easy WAL 的错误类型定义
+//! 测试 Easy WAL 的核心错误特性
 
 use easy_wal::{Error, Result};
 use std::io;
 
 #[test]
-fn test_io_error_creation() {
-    // 测试创建 IO 错误
-    let io_err = io::Error::new(io::ErrorKind::NotFound, "file not found");
-    let error = Error::Io(io_err);
-
-    assert!(matches!(error, Error::Io(_)));
-    assert!(error.to_string().contains("file not found"));
-}
-
-#[test]
-fn test_corruption_error_creation() {
-    // 测试创建数据损坏错误
-    let error = Error::Corruption {
-        offset: 1024,
-        reason: "CRC check failed".to_string(),
-    };
-
-    assert!(matches!(error, Error::Corruption { offset: 1024, .. }));
-    assert!(error.to_string().contains("CRC check failed"));
-    assert!(error.to_string().contains("1024"));
-}
-
-#[test]
-fn test_segment_error_creation() {
-    // 测试创建段错误
-    let error = Error::SegmentNotFound { offset: 2048 };
-
-    assert!(matches!(error, Error::SegmentNotFound { offset: 2048 }));
-    assert!(error.to_string().contains("2048"));
-}
-
-#[test]
-fn test_config_error_creation() {
-    // 测试创建配置错误
-    let error = Error::Config {
-        message: "segment size must be positive".to_string(),
-    };
-
-    assert!(matches!(error, Error::Config { .. }));
-    assert!(error.to_string().contains("segment size must be positive"));
-}
-
-#[test]
-fn test_closed_error_creation() {
-    // 测试创建已关闭错误
-    let error = Error::Closed;
-
-    assert!(matches!(error, Error::Closed));
-    assert!(error.to_string().contains("closed"));
-}
-
-#[test]
 fn test_from_io_error() {
-    // 测试从 std::io::Error 转换
+    // 测试从 std::io::Error 转换（重要的 trait 实现）
     let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "permission denied");
     let error: Error = io_err.into();
 
     assert!(matches!(error, Error::Io(_)));
-}
-
-#[test]
-fn test_result_type() {
-    // 测试 Result 类型别名
-    fn returns_error() -> Result<()> {
-        Err(Error::Config {
-            message: "test error".to_string(),
-        })
-    }
-
-    let result = returns_error();
-    assert!(result.is_err());
-
-    let error = result.unwrap_err();
-    assert!(matches!(error, Error::Config { .. }));
+    assert!(error.to_string().contains("permission denied"));
 }
 
 #[test]
@@ -94,21 +27,28 @@ fn test_error_send_sync() {
 fn test_error_display() {
     // 测试所有错误类型的 Display 实现
     let errors = vec![
-        Error::Io(io::Error::new(io::ErrorKind::NotFound, "test")),
+        Error::Io(io::Error::new(io::ErrorKind::NotFound, "file not found")),
         Error::Corruption {
-            offset: 0,
-            reason: "test".to_string(),
+            offset: 1024,
+            reason: "CRC check failed".to_string(),
         },
-        Error::SegmentNotFound { offset: 0 },
+        Error::SegmentNotFound { offset: 2048 },
         Error::Config {
-            message: "test".to_string(),
+            message: "invalid config".to_string(),
         },
         Error::Closed,
     ];
 
-    for error in errors {
-        // 确保每个错误都有有意义的 Display 输出
-        let msg = error.to_string();
-        assert!(!msg.is_empty());
+    // 验证每个错误变体的 Display 输出
+    for error in &errors {
+        let display_str = error.to_string();
+        assert!(!display_str.is_empty(), "Error display output is empty");
     }
+
+    // 验证具体的错误信息包含关键字
+    assert!(errors[0].to_string().contains("IO error"));
+    assert!(errors[1].to_string().contains("Data corruption"));
+    assert!(errors[2].to_string().contains("Segment not found"));
+    assert!(errors[3].to_string().contains("Configuration error"));
+    assert!(errors[4].to_string().contains("closed"));
 }
