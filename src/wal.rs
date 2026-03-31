@@ -7,8 +7,22 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+
+/// WAL 内部状态
+///
+/// 所有可变状态集中在一个结构中，用单一的 RwLock 保护
+struct WalInner {
+    /// 所有段的集合（按 base_offset 排序）
+    segments: BTreeMap<u64, Arc<RwLock<LogSegment>>>,
+
+    /// 当前活跃段
+    active_segment: Arc<RwLock<LogSegment>>,
+
+    /// 下一个写入偏移量
+    next_offset: u64,
+}
 
 /// WAL 对象
 ///
@@ -20,30 +34,22 @@ pub struct Wal {
     /// 配置
     config: Config,
 
-    /// 所有段的集合（按 base_offset 排序）
-    segments: RwLock<BTreeMap<u64, Arc<RwLock<LogSegment>>>>,
-
-    /// 当前活跃段
-    active_segment: RwLock<Arc<RwLock<LogSegment>>>,
-
-    /// 下一个写入偏移量（原子操作，无锁）
-    next_offset: AtomicU64,
+    /// 内部状态（单一 RwLock 保护）
+    inner: RwLock<WalInner>,
 
     /// 是否已关闭（原子操作，无锁）
     closed: AtomicBool,
-
-    /// 段轮转保护锁（确保只有一个线程能执行轮转）
-    rotate_lock: Mutex<()>,
 }
 
 impl fmt::Debug for Wal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = self.inner.read().unwrap();
         f.debug_struct("Wal")
             .field("path", &self.path)
             .field("config", &self.config)
-            .field("next_offset", &self.next_offset.load(Ordering::Acquire))
+            .field("next_offset", &inner.next_offset)
             .field("closed", &self.closed.load(Ordering::Acquire))
-            .field("segments_count", &self.segments.read().unwrap().len())
+            .field("segments_count", &inner.segments.len())
             .finish()
     }
 }
@@ -74,14 +80,17 @@ impl Wal {
         let mut segments = BTreeMap::new();
         segments.insert(0, Arc::clone(&active_segment));
 
+        let inner = WalInner {
+            segments,
+            active_segment,
+            next_offset: 0,
+        };
+
         let wal = Wal {
             path,
             config,
-            segments: RwLock::new(segments),
-            active_segment: RwLock::new(active_segment),
-            next_offset: AtomicU64::new(0),
+            inner: RwLock::new(inner),
             closed: AtomicBool::new(false),
-            rotate_lock: Mutex::new(()),
         };
 
         Ok(wal)
@@ -147,14 +156,17 @@ impl Wal {
         // 获取活跃段（最后一个段）
         let active_segment = Arc::clone(segments.values().last().unwrap());
 
+        let inner = WalInner {
+            segments,
+            active_segment,
+            next_offset: max_offset,
+        };
+
         let wal = Wal {
             path,
             config,
-            segments: RwLock::new(segments),
-            active_segment: RwLock::new(active_segment),
-            next_offset: AtomicU64::new(max_offset),
+            inner: RwLock::new(inner),
             closed: AtomicBool::new(false),
-            rotate_lock: Mutex::new(()),
         };
 
         Ok(wal)
@@ -173,63 +185,53 @@ impl Wal {
             return Err(Error::Closed);
         }
 
-        // 检查是否需要轮转（第一次检查）
+        let offset;
+        let need_sync;
+
+        // 使用单一写锁保护所有写入操作
         {
-            let active_segment = self.active_segment.read().unwrap();
-            let segment = active_segment.read().unwrap();
-            let segment_size = segment.size();
+            let mut inner = self.inner.write().unwrap();
 
             // 检查是否需要轮转
+            let segment_size = {
+                let segment = inner.active_segment.read().unwrap();
+                segment.size()
+            };
+
             let record_size = 12 + data.len() as u64; // header + data
             if segment_size + record_size > self.config.segment_size() as u64 {
                 // 需要轮转到新段
-                drop(segment);
-                drop(active_segment);
+                let next_offset = inner.next_offset;
+                let segment_path = self.path.join(format!("{:020}.log", next_offset));
 
-                // 获取轮转锁，确保只有一个线程能执行轮转
-                let _rotate_guard = self.rotate_lock.lock().unwrap();
+                // 创建新段
+                let new_segment = LogSegment::create(&segment_path, next_offset)?;
+                let new_segment = Arc::new(RwLock::new(new_segment));
 
-                // 再次检查是否需要轮转（第二次检查，double-check locking）
-                {
-                    let active_segment = self.active_segment.read().unwrap();
-                    let segment = active_segment.read().unwrap();
-                    let segment_size = segment.size();
-
-                    if segment_size + record_size > self.config.segment_size() as u64 {
-                        // 确实需要轮转，执行轮转
-                        drop(segment);
-                        drop(active_segment);
-                        self.rotate_segment()?;
-                    }
-                }
+                // 更新活跃段和段集合
+                inner.active_segment = Arc::clone(&new_segment);
+                inner.segments.insert(next_offset, new_segment);
             }
+
+            // 写入数据
+            offset = inner.next_offset;
+            let write_offset = {
+                let segment = inner.active_segment.write().unwrap();
+                segment.append(data)?
+            };
+
+            // 更新下一个偏移量
+            inner.next_offset = write_offset + 12 + data.len() as u64;
+
+            // 根据持久化模式决定是否同步
+            need_sync = self.config.persistence_mode() == PersistenceMode::Immediate;
         }
 
-        // 写入数据
-        let offset;
-        {
-            let active_segment = self.active_segment.read().unwrap();
-            let segment = active_segment.write().unwrap();
-
-            offset = self.next_offset.load(Ordering::Acquire);
-            let write_offset = segment.append(data)?;
-
-            // 更新下一个偏移量（原子操作）
-            self.next_offset
-                .store(write_offset + 12 + data.len() as u64, Ordering::Release);
-        }
-
-        // 根据持久化模式处理
-        match self.config.persistence_mode() {
-            PersistenceMode::Immediate => {
-                // Immediate 模式：立即刷新到磁盘
-                let active_segment = self.active_segment.read().unwrap();
-                let segment = active_segment.read().unwrap();
-                segment.sync()?;
-            }
-            PersistenceMode::Batch | PersistenceMode::Manual => {
-                // Batch/Manual 模式：不自动刷新，等待 flush() 调用
-            }
+        // 如果需要立即同步，在锁外执行（减少锁持有时间）
+        if need_sync {
+            let inner = self.inner.read().unwrap();
+            let segment = inner.active_segment.read().unwrap();
+            segment.sync()?;
         }
 
         Ok(offset)
@@ -248,19 +250,20 @@ impl Wal {
             return Err(Error::Closed);
         }
 
-        // 查找包含该偏移量的段
-        let segments = self.segments.read().unwrap();
+        // 使用读锁查找段
+        let segment = {
+            let inner = self.inner.read().unwrap();
 
-        // 使用二分查找找到对应的段
-        let segment = segments
-            .range(..=offset)
-            .next_back()
-            .map(|(_, seg)| Arc::clone(seg))
-            .ok_or_else(|| Error::SegmentNotFound { offset })?;
+            // 使用二分查找找到对应的段
+            inner
+                .segments
+                .range(..=offset)
+                .next_back()
+                .map(|(_, seg)| Arc::clone(seg))
+                .ok_or_else(|| Error::SegmentNotFound { offset })?
+        };
 
-        drop(segments);
-
-        // 从段中读取数据
+        // 从段中读取数据（段有自己的 RwLock，允许并发读）
         let segment = segment.read().unwrap();
         segment.read(offset)
     }
@@ -273,8 +276,8 @@ impl Wal {
         }
 
         // 刷新当前活跃段到磁盘
-        let active_segment = self.active_segment.read().unwrap();
-        let segment = active_segment.read().unwrap();
+        let inner = self.inner.read().unwrap();
+        let segment = inner.active_segment.read().unwrap();
         segment.sync()?;
 
         Ok(())
@@ -308,31 +311,28 @@ impl Wal {
             return Err(Error::Closed);
         }
 
-        // 获取活跃段的base_offset（活跃段不应该被删除）
-        let active_base_offset = {
-            let active_segment = self.active_segment.read().unwrap();
-            let segment = active_segment.read().unwrap();
-            segment.base_offset()
-        };
+        // 使用写锁保护整个清理操作
+        let segments_to_delete: Vec<u64> = {
+            let inner = self.inner.write().unwrap();
 
-        // 找到包含retain_min_offset的段（这个段及之后的段应该被保留）
-        // 这样可以确保包含retain_min_offset数据的段不会被清理
-        let retain_segment_base_offset: Option<u64> = {
-            let segments = self.segments.read().unwrap();
-            segments
+            // 获取活跃段的base_offset（活跃段不应该被删除）
+            let active_base_offset = {
+                let segment = inner.active_segment.read().unwrap();
+                segment.base_offset()
+            };
+
+            // 找到包含retain_min_offset的段（这个段及之后的段应该被保留）
+            let retain_segment_base_offset: Option<u64> = inner
+                .segments
                 .range(..=retain_min_offset)
                 .next_back()
-                .map(|(base_offset, _)| *base_offset)
-        };
+                .map(|(base_offset, _)| *base_offset);
 
-        // 找到所有需要删除的段
-        // 如果找到了retain_segment，清理所有base_offset < retain_segment_base_offset的段
-        // 如果没找到retain_segment，说明retain_min_offset超出了所有段的范围，不清理任何段
-        let segments_to_delete: Vec<u64> = {
-            let segments = self.segments.read().unwrap();
+            // 找到所有需要删除的段
             if let Some(retain_base_offset) = retain_segment_base_offset {
                 // 清理所有base_offset < retain_base_offset的段（除了活跃段）
-                segments
+                inner
+                    .segments
                     .keys()
                     .filter(|&base_offset| {
                         *base_offset < retain_base_offset && *base_offset != active_base_offset
@@ -352,9 +352,9 @@ impl Wal {
 
         // 从内存中移除这些段
         {
-            let mut segments = self.segments.write().unwrap();
+            let mut inner = self.inner.write().unwrap();
             for base_offset in &segments_to_delete {
-                segments.remove(base_offset);
+                inner.segments.remove(base_offset);
             }
         }
 
@@ -362,30 +362,6 @@ impl Wal {
         for base_offset in segments_to_delete {
             let segment_path = self.path.join(format!("{:020}.log", base_offset));
             std::fs::remove_file(&segment_path)?;
-        }
-
-        Ok(())
-    }
-
-    /// 轮转到新段
-    fn rotate_segment(&self) -> Result<()> {
-        let next_offset = self.next_offset.load(Ordering::Acquire);
-        let segment_path = self.path.join(format!("{:020}.log", next_offset));
-
-        // 创建新段
-        let new_segment = LogSegment::create(&segment_path, next_offset)?;
-        let new_segment = Arc::new(RwLock::new(new_segment));
-
-        // 更新活跃段
-        {
-            let mut active_segment = self.active_segment.write().unwrap();
-            *active_segment = Arc::clone(&new_segment);
-        }
-
-        // 添加到段集合
-        {
-            let mut segments = self.segments.write().unwrap();
-            segments.insert(next_offset, new_segment);
         }
 
         Ok(())
