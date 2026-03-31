@@ -13,12 +13,14 @@
 mod config;
 mod error;
 mod segment;
+mod stats;
 mod wal;
 
 // 重新导出公共类型
 pub use config::{Config, PersistenceMode};
 pub use error::{Error, Result};
 pub use segment::LogSegment;
+pub use stats::WalStats;
 pub use wal::Wal;
 
 #[cfg(test)]

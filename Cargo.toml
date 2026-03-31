@@ -3,6 +3,10 @@ name = "easy_wal"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+stats = []
+
 [dependencies]
 thiserror = "*"
 crc32fast = "*"

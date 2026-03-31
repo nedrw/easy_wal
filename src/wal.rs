@@ -2,7 +2,7 @@
 //!
 //! 实现 WAL 对象，提供主要的读写接口
 
-use crate::{Config, Error, LogSegment, PersistenceMode, Result};
+use crate::{Config, Error, LogSegment, PersistenceMode, Result, WalStats, stats::Stats};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
@@ -39,6 +39,9 @@ pub struct Wal {
 
     /// 是否已关闭（原子操作，无锁）
     closed: AtomicBool,
+
+    /// 统计信息（可开关，通过 stats feature 控制）
+    stats: crate::stats::Stats,
 }
 
 impl fmt::Debug for Wal {
@@ -91,6 +94,7 @@ impl Wal {
             config,
             inner: RwLock::new(inner),
             closed: AtomicBool::new(false),
+            stats: Stats::new(),
         };
 
         Ok(wal)
@@ -162,11 +166,16 @@ impl Wal {
             next_offset: max_offset,
         };
 
+        // 初始化统计信息
+        let stats = Stats::new();
+        stats.set_segment_count(inner.segments.len() as u64);
+
         let wal = Wal {
             path,
             config,
             inner: RwLock::new(inner),
             closed: AtomicBool::new(false),
+            stats,
         };
 
         Ok(wal)
@@ -211,6 +220,9 @@ impl Wal {
                 // 更新活跃段和段集合
                 inner.active_segment = Arc::clone(&new_segment);
                 inner.segments.insert(next_offset, new_segment);
+
+                // 统计：增加段数量
+                self.stats.increment_segment_count();
             }
 
             // 写入数据
@@ -233,6 +245,9 @@ impl Wal {
             let segment = inner.active_segment.read().unwrap();
             segment.sync()?;
         }
+
+        // 统计：记录写入操作
+        self.stats.record_write((12 + data.len()) as u64);
 
         Ok(offset)
     }
@@ -265,7 +280,12 @@ impl Wal {
 
         // 从段中读取数据（段有自己的 RwLock，允许并发读）
         let segment = segment.read().unwrap();
-        segment.read(offset)
+        let data = segment.read(offset)?;
+
+        // 统计：记录读取操作
+        self.stats.record_read();
+
+        Ok(data)
     }
 
     /// 刷新数据到磁盘
@@ -280,6 +300,9 @@ impl Wal {
         let segment = inner.active_segment.read().unwrap();
         segment.sync()?;
 
+        // 统计：记录刷新操作
+        self.stats.record_flush();
+
         Ok(())
     }
 
@@ -292,6 +315,17 @@ impl Wal {
     /// 获取 WAL 路径
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 获取 WAL 的统计信息
+    ///
+    /// # 返回
+    /// 返回当前统计信息的快照
+    ///
+    /// # 注意
+    /// 统计功能可通过 `stats` feature flag 控制开关（默认启用）
+    pub fn stats(&self) -> WalStats {
+        self.stats.snapshot()
     }
 
     /// 清理旧段，释放磁盘空间
@@ -362,6 +396,9 @@ impl Wal {
         for base_offset in segments_to_delete {
             let segment_path = self.path.join(format!("{:020}.log", base_offset));
             std::fs::remove_file(&segment_path)?;
+
+            // 统计：减少段数量
+            self.stats.decrement_segment_count();
         }
 
         Ok(())
