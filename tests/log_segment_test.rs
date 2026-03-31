@@ -55,7 +55,7 @@ fn test_append_single_record() {
     let temp_dir = TempDir::new().unwrap();
     let segment_path = temp_dir.path().join("00000000000000000000.log");
 
-    let mut segment = LogSegment::create(&segment_path, 0).unwrap();
+    let segment = LogSegment::create(&segment_path, 0).unwrap();
 
     let data = b"test data";
     let offset = segment.append(data).unwrap();
@@ -73,7 +73,7 @@ fn test_append_multiple_records() {
     let temp_dir = TempDir::new().unwrap();
     let segment_path = temp_dir.path().join("00000000000000000000.log");
 
-    let mut segment = LogSegment::create(&segment_path, 0).unwrap();
+    let segment = LogSegment::create(&segment_path, 0).unwrap();
 
     let data1 = b"first record";
     let data2 = b"second record";
@@ -94,7 +94,7 @@ fn test_read_single_record() {
     let temp_dir = TempDir::new().unwrap();
     let segment_path = temp_dir.path().join("00000000000000000000.log");
 
-    let mut segment = LogSegment::create(&segment_path, 0).unwrap();
+    let segment = LogSegment::create(&segment_path, 0).unwrap();
 
     let original_data = b"test data for reading";
     let offset = segment.append(original_data).unwrap();
@@ -111,7 +111,7 @@ fn test_read_multiple_records() {
     let temp_dir = TempDir::new().unwrap();
     let segment_path = temp_dir.path().join("00000000000000000000.log");
 
-    let mut segment = LogSegment::create(&segment_path, 0).unwrap();
+    let segment = LogSegment::create(&segment_path, 0).unwrap();
 
     let records = vec![
         b"record 1".to_vec(),
@@ -168,7 +168,7 @@ fn test_append_empty_data() {
     let temp_dir = TempDir::new().unwrap();
     let segment_path = temp_dir.path().join("00000000000000000000.log");
 
-    let mut segment = LogSegment::create(&segment_path, 0).unwrap();
+    let segment = LogSegment::create(&segment_path, 0).unwrap();
 
     let empty_data = b"";
     let offset = segment.append(empty_data).unwrap();
@@ -184,7 +184,7 @@ fn test_data_integrity_with_crc() {
     let temp_dir = TempDir::new().unwrap();
     let segment_path = temp_dir.path().join("00000000000000000000.log");
 
-    let mut segment = LogSegment::create(&segment_path, 0).unwrap();
+    let segment = LogSegment::create(&segment_path, 0).unwrap();
 
     let original_data = b"data with crc check";
     let offset = segment.append(original_data).unwrap();
@@ -203,7 +203,7 @@ fn test_segment_size_tracking() {
     let temp_dir = TempDir::new().unwrap();
     let segment_path = temp_dir.path().join("00000000000000000000.log");
 
-    let mut segment = LogSegment::create(&segment_path, 0).unwrap();
+    let segment = LogSegment::create(&segment_path, 0).unwrap();
 
     let initial_size = segment.size();
     assert_eq!(initial_size, 0);
