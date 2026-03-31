@@ -10,4 +10,32 @@
 //! - etcd/raft WAL 的简洁架构
 //! - RocksDB WAL 的读写分离模式
 
-// 占位符：后续实现核心功能
+mod async_segment;
+mod async_wal;
+mod config;
+mod error;
+mod segment;
+mod wal;
+
+// 重新导出公共类型
+pub use async_segment::AsyncLogSegment;
+pub use async_wal::AsyncWal;
+pub use config::{Config, PersistenceMode};
+pub use error::{Error, Result};
+pub use segment::LogSegment;
+pub use wal::Wal;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_library_exports() {
+        // 确保所有公共类型都正确导出
+        let config = Config::default();
+        assert!(config.segment_size() > 0);
+
+        let persistence_mode = PersistenceMode::Immediate;
+        assert_eq!(persistence_mode, PersistenceMode::Immediate);
+    }
+}
