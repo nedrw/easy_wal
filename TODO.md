@@ -301,7 +301,7 @@ pub fn write_batch(&self, records: &[&[u8]]) -> Result<Vec<u64>>;
   - Immediate 模式：每次写入后只刷新该记录（几十字节），性能大幅提升
   - Batch 模式：flush 时只刷新未刷新的数据，避免重复刷新
   - 数据安全性：确保所有数据都被刷新，不会丢失数据
-- **Git commit**：待提交
+- **Git commit**：7cba931
 
 ### ✅ 待办 3.1：添加监控指标
 - **完成时间**：YYYY-MM-DD
