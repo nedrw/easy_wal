@@ -390,7 +390,7 @@ pub fn restore_from_snapshot(&self, path: &Path) -> Result<()>;
   - 默认关闭：完全零开销，压缩相关代码不会被编译
   - 启用压缩：根据数据内容和长度，压缩率可达50-90%，CPU开销取决于压缩算法
   - CompressionAlgo::None：无论是否启用compression feature，都是零开销（直接返回原数据）
-- **Git commit**：[待提交]
+- **Git commit**：eff843d
 
 ### ✅ 待办 3.3：批量写入优化
 - **完成时间**：YYYY-MM-DD
