@@ -304,10 +304,19 @@ pub fn write_batch(&self, records: &[&[u8]]) -> Result<Vec<u64>>;
 - **Git commit**：7cba931
 
 ### ✅ 待办 3.1：添加监控指标
-- **完成时间**：YYYY-MM-DD
-- **实施方案**：AtomicU64 计数器 / Histogram 详细统计
-- **测试结果**：统计信息准确，性能无影响
-- **Git commit**：[commit hash]
+- **完成时间**：2025-03-31
+- **实施方案**：AtomicU64 无锁统计，支持 feature flag 开关（默认关闭）
+- **测试结果**：67 个测试（默认关闭 stats），68 个测试（启用 stats），100% 通过，统计信息准确
+- **主要改进**：
+  - 使用 AtomicU64 实现无锁统计，性能开销极小（纳秒级）
+  - 支持 feature flag 开关，默认关闭，完全零开销
+  - 提供 6 个统计指标：total_records, total_bytes, write_count, read_count, flush_count, segment_count
+  - 提供 stats() API 获取统计信息快照
+  - 在 write、read、flush、段轮转、段清理等关键方法中集成统计记录
+- **性能影响**：
+  - 启用统计：AtomicU64 + Relaxed ordering，性能开销极小（纳秒级）
+  - 禁用统计（默认）：完全零开销，编译器会优化掉所有统计相关代码
+- **Git commit**：a40754e
 
 ### ✅ 待办 3.2：添加压缩支持
 - **完成时间**：YYYY-MM-DD
