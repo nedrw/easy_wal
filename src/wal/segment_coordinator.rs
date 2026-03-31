@@ -2,11 +2,12 @@
 //!
 //! # 设计目标
 //! - 集中管理段轮转策略
-//! - 为 LogWriter 提供统一的段管理接口
+//! - 为 LogSegment 提供统一的段管理接口（Kafka 模式）
 //! - 支持 Multi-Writer 场景
+//! - 读写在同一段内共享状态
 
 use crate::prelude::*;
-use crate::storage::{FileStorage, LogWriter, SegmentConfig, SegmentMeta, SegmentStats};
+use crate::storage::{FileStorage, LogSegment, SegmentConfig, SegmentMeta, SegmentStats};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -77,8 +78,8 @@ pub struct SegmentCoordinator {
     /// 段管理器（底层操作）
     segment_manager: RwLock<crate::storage::SegmentManager>,
 
-    /// 活跃段的写入器
-    active_writer: RwLock<Option<Arc<LogWriter>>>,
+    /// 活跃段的 LogSegment（读写共享）
+    active_segment: RwLock<Option<Arc<LogSegment>>>,
 
     /// 轮转策略配置
     rotation_config: RotationConfig,
@@ -108,26 +109,27 @@ impl SegmentCoordinator {
 
         Ok(Self {
             segment_manager: RwLock::new(segment_manager),
-            active_writer: RwLock::new(None),
+            active_segment: RwLock::new(None),
             rotation_config,
             segment_config,
             stats: RwLock::new(stats),
         })
     }
 
-    /// 获取当前活跃段的写入器
+    /// 获取当前活跃段的 LogSegment
     ///
-    /// 如果没有活跃写入器，会自动创建。
-    pub async fn get_active_writer(&self) -> Result<Arc<LogWriter>> {
-        // 1. 检查是否有活跃写入器
+    /// 如果没有活跃段，会自动创建。
+    /// 用于写入和读取当前活跃段。
+    pub async fn get_active_segment(&self) -> Result<Arc<LogSegment>> {
+        // 1. 检查是否有活跃段
         {
-            let writer = self.active_writer.read().await;
-            if let Some(ref w) = *writer {
-                return Ok(w.clone());
+            let segment = self.active_segment.read().await;
+            if let Some(ref s) = *segment {
+                return Ok(s.clone());
             }
         }
 
-        // 2. 需要创建活跃写入器
+        // 2. 需要创建活跃段
         let mut manager = self.segment_manager.write().await;
 
         // 如果没有活跃段，创建第一个
@@ -150,23 +152,68 @@ impl SegmentCoordinator {
         // 写入段文件头（如果文件为空）
         storage.write_header_if_empty().await?;
 
-        // 创建写入器
-        let writer = Arc::new(LogWriter::new(storage, segment_id));
+        // 创建 LogSegment
+        let log_segment = Arc::new(LogSegment::new(storage, segment_id));
 
-        // 保存到活跃写入器
-        let mut active = self.active_writer.write().await;
-        *active = Some(writer.clone());
+        // 保存到活跃段
+        let mut active = self.active_segment.write().await;
+        *active = Some(log_segment.clone());
 
         // 更新统计信息：记录段创建时间
         let mut stats = self.stats.write().await;
         stats.current_segment_created_at = Some(Instant::now());
 
-        Ok(writer)
+        Ok(log_segment)
+    }
+
+    /// 获取指定段的 LogSegment（用于读取历史段）
+    ///
+    /// # 参数
+    /// - `segment_id`: 段 ID
+    ///
+    /// # 返回
+    /// 返回指定段的 LogSegment，如果段不存在则返回 None
+    pub async fn get_segment(&self, segment_id: u64) -> Result<Option<Arc<LogSegment>>> {
+        // 检查是否是活跃段
+        let active_id = {
+            let manager = self.segment_manager.read().await;
+            manager.active_id()
+        };
+
+        if segment_id == active_id {
+            // 活跃段：直接返回活跃段的 LogSegment
+            return Ok(Some(self.get_active_segment().await?));
+        }
+
+        // 历史段：检查段是否存在
+        let path = {
+            let manager = self.segment_manager.read().await;
+            manager.segment_path(segment_id)
+        };
+
+        if let Some(path) = path {
+            if !path.exists() {
+                return Ok(None);
+            }
+
+            // 创建存储
+            let storage = Arc::new(FileStorage::new(&path).await.map_err(|e| {
+                Error::Generic(format!("Failed to open segment {}: {}", segment_id, e))
+            })?);
+
+            // 创建 LogSegment（从现有文件）
+            let log_segment = Arc::new(LogSegment::from_existing(storage, segment_id).await?);
+
+            Ok(Some(log_segment))
+        } else {
+            Ok(None)
+        }
     }
 
     /// 更新段大小
     ///
     /// 在写入数据后调用，更新统计信息。
+    /// 注意：LogSegment 的 write_position 会自动更新，这里只更新统计信息。
     pub async fn update_size(&self, bytes_written: u64, records_written: u64) {
         let mut manager = self.segment_manager.write().await;
         manager.update_active_size(bytes_written);
@@ -234,8 +281,8 @@ impl SegmentCoordinator {
             .create_segment()
             .map_err(|e| Error::Generic(format!("Failed to create segment: {}", e)))?;
 
-        // 2. 清除旧写入器
-        let mut active = self.active_writer.write().await;
+        // 2. 清除旧段
+        let mut active = self.active_segment.write().await;
         *active = None;
 
         // 3. 重置统计信息
@@ -251,6 +298,22 @@ impl SegmentCoordinator {
     pub async fn active_segment_id(&self) -> u64 {
         let manager = self.segment_manager.read().await;
         manager.active_id()
+    }
+
+    /// 获取指定段的元数据
+    ///
+    /// 用于检查段是否存在
+    pub async fn get_segment_meta(&self, segment_id: u64) -> Option<SegmentMeta> {
+        let manager = self.segment_manager.read().await;
+        manager.get_segment(segment_id).cloned()
+    }
+
+    /// 获取指定段的路径
+    ///
+    /// 返回段文件的完整路径
+    pub async fn segment_path(&self, segment_id: u64) -> Option<PathBuf> {
+        let manager = self.segment_manager.read().await;
+        manager.segment_path(segment_id)
     }
 
     /// 获取当前活跃段大小
@@ -269,6 +332,12 @@ impl SegmentCoordinator {
     pub async fn segment_count(&self) -> usize {
         let manager = self.segment_manager.read().await;
         manager.segment_count()
+    }
+
+    /// 检查段列表是否为空
+    pub async fn segments_is_empty(&self) -> bool {
+        let manager = self.segment_manager.read().await;
+        manager.segments().is_empty()
     }
 
     /// 获取段统计信息
@@ -309,7 +378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_active_writer() {
+    async fn test_get_active_segment() {
         let temp_dir = tempdir().unwrap();
         let rotation_config = RotationConfig::new().with_max_size(1000);
         let segment_config = SegmentConfig::new(temp_dir.path());
@@ -318,13 +387,13 @@ mod tests {
             .await
             .unwrap();
 
-        // 获取活跃写入器（会自动创建第一个段）
-        let writer = coordinator.get_active_writer().await.unwrap();
-        assert_eq!(writer.segment_id(), 1);
+        // 获取活跃段（会自动创建第一个段）
+        let segment = coordinator.get_active_segment().await.unwrap();
+        assert_eq!(segment.segment_id(), 1);
 
-        // 再次获取，应该是同一个写入器
-        let writer2 = coordinator.get_active_writer().await.unwrap();
-        assert_eq!(writer2.segment_id(), 1);
+        // 再次获取，应该是同一个段
+        let segment2 = coordinator.get_active_segment().await.unwrap();
+        assert_eq!(segment2.segment_id(), 1);
     }
 
     #[tokio::test]
@@ -337,11 +406,11 @@ mod tests {
             .await
             .unwrap();
 
-        // 获取写入器
-        let writer = coordinator.get_active_writer().await.unwrap();
+        // 获取活跃段
+        let segment = coordinator.get_active_segment().await.unwrap();
 
         // 写入数据
-        let pos = writer.write(b"hello world").await.unwrap();
+        let pos = segment.append(b"hello world").await.unwrap();
         assert_eq!(pos.segment_id, 1);
 
         // 更新大小
@@ -353,7 +422,7 @@ mod tests {
 
         // 写入更多数据触发轮转
         for _ in 0..10 {
-            writer.write(b"test data").await.unwrap();
+            segment.append(b"test data").await.unwrap();
             coordinator.update_size(21, 1).await; // 12 字节记录头 + 9 字节数据
         }
 
@@ -361,9 +430,9 @@ mod tests {
         let rotated = coordinator.check_and_rotate().await.unwrap();
         assert!(rotated);
 
-        // 获取新的写入器（应该是新段）
-        let writer2 = coordinator.get_active_writer().await.unwrap();
-        assert_eq!(writer2.segment_id(), 2);
+        // 获取新的段（应该是新段）
+        let segment2 = coordinator.get_active_segment().await.unwrap();
+        assert_eq!(segment2.segment_id(), 2);
     }
 
     #[tokio::test]
@@ -377,16 +446,16 @@ mod tests {
             .unwrap();
 
         // 创建第一个段
-        let writer = coordinator.get_active_writer().await.unwrap();
-        assert_eq!(writer.segment_id(), 1);
+        let segment = coordinator.get_active_segment().await.unwrap();
+        assert_eq!(segment.segment_id(), 1);
 
         // 强制轮转
         let (new_id, _path) = coordinator.force_rotate().await.unwrap();
         assert_eq!(new_id, 2);
 
-        // 获取新写入器
-        let writer2 = coordinator.get_active_writer().await.unwrap();
-        assert_eq!(writer2.segment_id(), 2);
+        // 获取新段
+        let segment2 = coordinator.get_active_segment().await.unwrap();
+        assert_eq!(segment2.segment_id(), 2);
     }
 
     #[tokio::test]
@@ -401,12 +470,12 @@ mod tests {
             .await
             .unwrap();
 
-        let writer = coordinator.get_active_writer().await.unwrap();
+        let segment = coordinator.get_active_segment().await.unwrap();
 
         // 写入 5 条记录
         for i in 0..5 {
-            writer
-                .write(format!("record {}", i).as_bytes())
+            segment
+                .append(format!("record {}", i).as_bytes())
                 .await
                 .unwrap();
             coordinator.update_size(20, 1).await;

@@ -101,11 +101,11 @@ impl WriteCoordinator {
             )));
         }
 
-        // 1. 从协调器获取活跃写入器
-        let writer = self.segment_coordinator.get_active_writer().await?;
+        // 1. 从协调器获取活跃段（Kafka 模式）
+        let segment = self.segment_coordinator.get_active_segment().await?;
 
         // 2. 执行写入
-        let pos = writer.write(data).await?;
+        let pos = segment.append(data).await?;
 
         // 3. 更新段大小（通知协调器）
         let bytes_written = crate::storage::format::RECORD_HEADER_SIZE + data.len() as u64;
@@ -146,11 +146,11 @@ impl WriteCoordinator {
             }
         }
 
-        // 1. 从协调器获取活跃写入器
-        let writer = self.segment_coordinator.get_active_writer().await?;
+        // 1. 从协调器获取活跃段（Kafka 模式）
+        let segment = self.segment_coordinator.get_active_segment().await?;
 
         // 2. 执行批量写入
-        let positions = writer.write_batch(data_list).await?;
+        let positions = segment.append_batch(data_list).await?;
 
         // 3. 更新段大小（通知协调器）
         let total_bytes = data_list
@@ -206,9 +206,9 @@ impl WriteCoordinator {
     async fn do_sync(&self) -> Result<SyncReport> {
         let start = std::time::Instant::now();
 
-        // 获取活跃写入器并同步
-        let writer = self.segment_coordinator.get_active_writer().await?;
-        let result = writer.sync().await;
+        // 获取活跃段并同步（Kafka 模式）
+        let segment = self.segment_coordinator.get_active_segment().await?;
+        let result = segment.sync().await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -257,9 +257,9 @@ impl WriteCoordinator {
     /// 关闭写入协调器
     pub async fn close(&self) -> Result<()> {
         self.sync().await?;
-        // 获取活跃写入器并关闭
-        let writer = self.segment_coordinator.get_active_writer().await?;
-        writer.close().await
+        // 获取活跃段并同步（Kafka 模式）
+        let segment = self.segment_coordinator.get_active_segment().await?;
+        segment.sync().await
     }
 }
 

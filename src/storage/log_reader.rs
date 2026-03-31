@@ -79,13 +79,10 @@ pub struct LogReader {
 impl LogReader {
     /// 创建日志读取器
     pub async fn new(config: LogReaderConfig) -> Result<Self> {
-        let mut segment_manager = SegmentManager::new(config.segment_config.clone())
+        // 注意：不再创建第一个段，段创建由 WriteCoordinator 负责
+        // LogReader 只负责读取，不应该有写操作
+        let segment_manager = SegmentManager::new(config.segment_config.clone())
             .map_err(|e| Error::Generic(format!("Failed to create segment manager: {}", e)))?;
-
-        // 如果没有现有段，创建第一个段
-        if segment_manager.segments().is_empty() {
-            segment_manager.create_segment().ok();
-        }
 
         Ok(Self {
             config,
@@ -135,6 +132,18 @@ impl LogReader {
         *active = Some(storage.clone());
 
         Ok(storage)
+    }
+
+    /// 检查段文件是否存在
+    ///
+    /// 直接通过文件系统检查，不依赖 SegmentManager 的状态。
+    /// 这使得 LogReader 可以检测到由 WriteCoordinator 创建的新段。
+    fn segment_exists(&self, segment_id: u64) -> bool {
+        let path = self.config.segment_config.dir.join(format!(
+            "{}{}.{}",
+            self.config.segment_config.prefix, segment_id, self.config.segment_config.extension
+        ));
+        path.exists()
     }
 
     /// 读取单条数据
@@ -206,9 +215,7 @@ impl LogReader {
                 Err(Error::Generic(_)) => {
                     // 当前段不存在，尝试切换到下一个段
                     let next_segment_id = segment_id + 1;
-                    let manager = self.segment_manager.read().await;
-                    if manager.get_segment(next_segment_id).is_some() {
-                        drop(manager);
+                    if self.segment_exists(next_segment_id) {
                         let mut pos = self.position.write().await;
                         pos.segment_id = next_segment_id;
                         pos.offset = format::SEGMENT_HEADER_SIZE;
@@ -232,9 +239,7 @@ impl LogReader {
             if read_len == 0 {
                 // 到达段末尾，尝试切换到下一个段
                 let next_segment_id = segment_id + 1;
-                let manager = self.segment_manager.read().await;
-                if manager.get_segment(next_segment_id).is_some() {
-                    drop(manager);
+                if self.segment_exists(next_segment_id) {
                     let mut pos = self.position.write().await;
                     pos.segment_id = next_segment_id;
                     pos.offset = format::SEGMENT_HEADER_SIZE;
@@ -287,9 +292,7 @@ impl LogReader {
                 Err(Error::Generic(_)) => {
                     // 当前段不存在，尝试切换到下一个段
                     let next_segment_id = current_segment_id + 1;
-                    let manager = self.segment_manager.read().await;
-                    if manager.get_segment(next_segment_id).is_some() {
-                        drop(manager);
+                    if self.segment_exists(next_segment_id) {
                         current_segment_id = next_segment_id;
                         current_offset = format::SEGMENT_HEADER_SIZE;
                         continue;
@@ -312,9 +315,7 @@ impl LogReader {
             if read_len == 0 {
                 // 到达段末尾，尝试切换到下一个段
                 let next_segment_id = current_segment_id + 1;
-                let manager = self.segment_manager.read().await;
-                if manager.get_segment(next_segment_id).is_some() {
-                    drop(manager);
+                if self.segment_exists(next_segment_id) {
                     current_segment_id = next_segment_id;
                     current_offset = format::SEGMENT_HEADER_SIZE;
                     continue;
@@ -372,10 +373,8 @@ impl LogReader {
                 let next_segment_id = segment_id + 1;
 
                 // 检查是否有下一个段
-                let manager = self.segment_manager.read().await;
-                if manager.get_segment(next_segment_id).is_some() {
+                if self.segment_exists(next_segment_id) {
                     // 切换到下一个段
-                    drop(manager);
                     let mut pos = self.position.write().await;
                     pos.segment_id = next_segment_id;
                     pos.offset = format::SEGMENT_HEADER_SIZE;

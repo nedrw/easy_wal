@@ -145,6 +145,7 @@ pub mod format {
 pub mod checksum;
 pub mod file_storage;
 pub mod log_reader;
+pub mod log_segment;
 pub mod log_writer;
 pub mod memory_storage;
 pub mod segment_manager;
@@ -152,7 +153,8 @@ pub mod segment_manager;
 pub use checksum::{Crc32, crc32, verify_crc32};
 pub use file_storage::FileStorage;
 pub use log_reader::{LogReader, LogReaderConfig, ReadPosition};
-pub use log_writer::{LogWriter, LogWriterConfig, WritePosition};
+pub use log_segment::{LogSegment, ReadBatchResult, ReadNextResult, ReadRawResult, WritePosition};
+pub use log_writer::{LogWriter, LogWriterConfig};
 pub use memory_storage::MemoryStorage;
 pub use segment_manager::{SegmentConfig, SegmentManager, SegmentMeta, SegmentStats};
 

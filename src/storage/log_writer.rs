@@ -5,7 +5,7 @@
 //! - 学习状态管理
 //! - 学习资源池化
 
-use super::{FileStorage, SegmentConfig, Storage, crc32, format};
+use super::{FileStorage, SegmentConfig, Storage, crc32, format, log_segment::WritePosition};
 use crate::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
@@ -40,16 +40,8 @@ impl LogWriterConfig {
     }
 }
 
-/// 写入位置信息
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WritePosition {
-    /// 段 ID
-    pub segment_id: u64,
-    /// 段内偏移量
-    pub offset: u64,
-    /// 数据长度
-    pub length: u64,
-}
+// WritePosition 已移至 log_segment.rs（Kafka 模式统一）
+// 这里通过 use super::log_segment::WritePosition 导入
 
 /// 日志写入器（轻量级版本）
 ///
