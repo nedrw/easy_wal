@@ -10,16 +10,12 @@
 //! - etcd/raft WAL 的简洁架构
 //! - RocksDB WAL 的读写分离模式
 
-mod async_segment;
-mod async_wal;
 mod config;
 mod error;
 mod segment;
 mod wal;
 
 // 重新导出公共类型
-pub use async_segment::AsyncLogSegment;
-pub use async_wal::AsyncWal;
 pub use config::{Config, PersistenceMode};
 pub use error::{Error, Result};
 pub use segment::LogSegment;

@@ -1,13 +1,13 @@
 # Easy WAL
 
-基于 Kafka Log 模式的极简 WAL（Write-Ahead Log）库，提供同步和异步两种 API。
+基于 Kafka Log 模式的极简 WAL（Write-Ahead Log）库。
 
 ## 设计理念
 
 **极简架构**：借鉴 Kafka Log 的设计思想，避免过度分层，状态集中管理。
 
 **核心原则**：
-- 单一入口：WAL/AsyncWal 对象作为唯一对外接口
+- 单一入口：Wal 对象作为唯一对外接口
 - 状态一致：读写共享同一个段对象
 - 职责清晰：组件层只负责段内操作，协调层负责段管理决策
 
@@ -18,7 +18,6 @@
 - ✅ **高性能**：内置 CRC32 优化和批量写入支持
 - ✅ **可靠性强**：数据完整性校验和崩溃恢复
 - ✅ **并发安全**：线程安全的实现，支持多线程并发读写
-- ✅ **异步支持**：提供 AsyncWal 异步 API，适用于高并发场景
 - ✅ **多种持久化模式**：Immediate、Batch、Manual 三种模式满足不同需求
 - ✅ **段自动轮转**：基于大小自动创建新段文件
 - ✅ **旧段清理**：支持清理过期段文件，释放磁盘空间
@@ -33,10 +32,9 @@ easy_wal = "0.1.0"
 
 [dev-dependencies]
 tempfile = "*"  # 用于测试
-tokio = { version = "1", features = ["full"] }  # 如果使用 AsyncWal
 ```
 
-### 同步 Wal 基本用法
+### 基本用法
 
 ```rust
 use easy_wal::{Wal, Config, PersistenceMode};
@@ -70,73 +68,152 @@ wal.prune_segments(100).unwrap(); // 保留 offset >= 100 的数据
 wal.close().unwrap();
 ```
 
-### 异步 AsyncWal 基本用法
+## 在异步环境中使用 Wal
+
+Easy WAL 提供同步接口，但可以轻松集成到异步环境中。根据你的异步运行时，选择合适的适配方式：
+
+### Tokio 环境（推荐）
+
+使用 `spawn_blocking` 在异步上下文中执行同步 WAL 操作：
 
 ```rust
-use easy_wal::{AsyncWal, Config, PersistenceMode};
-use tempfile::TempDir;
+use easy_wal::{Wal, Config, PersistenceMode};
+use std::sync::Arc;
+use tokio::task::spawn_blocking;
 
-let temp_dir = TempDir::new().unwrap();
-let wal_path = temp_dir.path().join("async_wal");
-
-// 创建 AsyncWal
-let config = Config::new()
-    .with_persistence_mode(PersistenceMode::Manual);
-
-let wal = AsyncWal::create(&wal_path, config).await.unwrap();
-
-// 异步写入数据
-let data = b"Hello, Async WAL!";
-let offset = wal.write(data).await.unwrap();
-
-// 异步 flush
-wal.flush().await.unwrap();
-
-// 异步读取数据
-let read_data = wal.read(offset).await.unwrap();
-assert_eq!(read_data, data);
-
-// 异步关闭
-wal.close().await.unwrap();
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let wal = Arc::new(Wal::create("my_wal", Config::default())?);
+    
+    // 异步写入数据
+    let wal_clone = Arc::clone(&wal);
+    let data = b"Hello from async!".to_vec();
+    let offset = spawn_blocking(move || {
+        wal_clone.write(&data)
+    }).await??;
+    
+    // 异步读取数据
+    let wal_clone = Arc::clone(&wal);
+    let read_data = spawn_blocking(move || {
+        wal_clone.read(offset)
+    }).await??;
+    
+    println!("Read: {:?}", String::from_utf8_lossy(&read_data));
+    
+    Ok(())
+}
 ```
 
-### 异步并发写入示例
+### 封装异步适配器
+
+如果需要在多个地方使用，可以封装一个适配器：
 
 ```rust
-use easy_wal::{AsyncWal, Config, PersistenceMode};
+use easy_wal::{Wal, Config, Error};
 use std::sync::Arc;
-use tokio::task;
-use tempfile::TempDir;
+use tokio::task::spawn_blocking;
 
-let temp_dir = TempDir::new().unwrap();
-let wal_path = temp_dir.path().join("concurrent_wal");
-
-let config = Config::new()
-    .with_persistence_mode(PersistenceMode::Manual)
-    .with_segment_size(10 * 1024 * 1024); // 10MB
-
-let wal = Arc::new(AsyncWal::create(&wal_path, config).await.unwrap());
-
-// 启动多个并发写入任务
-let mut tasks = vec![];
-for task_id in 0..5 {
-    let wal_clone = Arc::clone(&wal);
-    let task = task::spawn(async move {
-        for i in 0..20 {
-            let data = format!("Task {} - Record {}", task_id, i);
-            wal_clone.write(data.as_bytes()).await.unwrap();
-        }
-    });
-    tasks.push(task);
+/// 异步 WAL 适配器（Tokio 版本）
+pub struct AsyncWalAdapter {
+    inner: Arc<Wal>,
 }
 
-// 等待所有任务完成
-for task in tasks {
-    task.await.unwrap();
+impl AsyncWalAdapter {
+    pub fn create(path: impl AsRef<std::path::Path>, config: Config) -> Result<Self, Error> {
+        Ok(Self {
+            inner: Arc::new(Wal::create(path, config)?),
+        })
+    }
+    
+    pub async fn write(&self, data: &[u8]) -> Result<u64, Error> {
+        let inner = Arc::clone(&self.inner);
+        let data = data.to_vec();
+        spawn_blocking(move || inner.write(&data))
+            .await
+            .map_err(|_| Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "spawn_blocking failed"
+            )))?
+    }
+    
+    pub async fn read(&self, offset: u64) -> Result<Vec<u8>, Error> {
+        let inner = Arc::clone(&self.inner);
+        spawn_blocking(move || inner.read(offset))
+            .await
+            .map_err(|_| Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "spawn_blocking failed"
+            )))?
+    }
+    
+    pub async fn flush(&self) -> Result<(), Error> {
+        let inner = Arc::clone(&self.inner);
+        spawn_blocking(move || inner.flush())
+            .await
+            .map_err(|_| Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "spawn_blocking failed"
+            )))?
+    }
 }
+```
 
-// 最终 flush
-wal.flush().await.unwrap();
+### 其他异步运行时
+
+**async-std**:
+```rust
+use async_std::task::spawn_blocking;
+// 用法与 Tokio 类似
+```
+
+**smol**:
+```rust
+use smol::blocking;
+// 使用 smol::blocking 替代 spawn_blocking
+```
+
+### 并发写入示例
+
+```rust
+use easy_wal::{Wal, Config, PersistenceMode};
+use std::sync::Arc;
+use tokio::task::spawn_blocking;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let wal = Arc::new(Wal::create(
+        "concurrent_wal",
+        Config::new().with_persistence_mode(PersistenceMode::Manual)
+    )?);
+    
+    // 启动多个并发写入任务
+    let mut tasks = vec![];
+    for task_id in 0..5 {
+        let wal_clone = Arc::clone(&wal);
+        let task = tokio::spawn(async move {
+            for i in 0..20 {
+                let data = format!("Task {} - Record {}", task_id, i);
+                let inner = Arc::clone(&wal_clone);
+                spawn_blocking(move || inner.write(data.as_bytes()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        });
+        tasks.push(task);
+    }
+    
+    // 等待所有任务完成
+    for task in tasks {
+        task.await?;
+    }
+    
+    // 最终 flush
+    let inner = Arc::clone(&wal);
+    spawn_blocking(move || inner.flush()).await??;
+    
+    Ok(())
+}
 ```
 
 ## 持久化模式
@@ -201,49 +278,23 @@ wal.flush().unwrap();
 - ❌ 需要手动管理 flush，可能丢失数据
 - 适用场景：高性能场景、批量导入、临时数据
 
-## API 选择指南
-
-### 使用同步 Wal 的场景
-
-- 单线程应用
-- 简单的日志记录
-- 不需要高并发
-- 快速原型开发
-
-### 使用异步 AsyncWal 的场景
-
-- 高并发应用（Web 服务、API 服务）
-- 需要非阻塞 I/O
-- Tokio 异步 runtime 环境
-- 多任务并发写入
-
 ## 性能指标
 
 基于测试环境的性能参考（具体性能取决于硬件和场景）：
 
-| 模式 | 同步 Wal | 异步 AsyncWal |
-|------|----------|---------------|
-| Manual | 100+ MB/s | 100+ MB/s |
-| Batch | 50+ MB/s | 50+ MB/s |
-| Immediate | 0.2 MB/s | 0.2 MB/s |
+| 模式 | 吞吐量 | 适用场景 |
+|------|--------|---------|
+| Manual | 100+ MB/s | 最高性能，手动 flush |
+| Batch | 50+ MB/s | 平衡方案，批量 flush |
+| Immediate | 0.2 MB/s | 最高可靠性，每次写入 sync |
 
 **注**：性能测试在并发场景下运行，孤立测试可达更高吞吐量。
-
-## 更多示例
-
-查看 `examples/` 目录中的完整示例：
-
-- `examples/async_wal_example.rs` - AsyncWal 综合示例
-  - 基本用法
-  - 持久化模式对比
-  - 并发写入
-  - 重新打开 WAL
 
 ## 测试覆盖
 
 项目包含完整的测试套件：
 
-- ✅ 100 个测试，100% 通过率
+- ✅ 87 个测试，100% 通过率
 - ✅ 功能测试：创建、写入、读取、flush、关闭
 - ✅ 并发测试：多线程并发读写
 - ✅ 崩溃恢复测试：数据完整性验证
@@ -261,16 +312,30 @@ wal.flush().unwrap();
 
 ## 开发状态
 
-**Phase 3 已完成**：
+**Phase 2.5 已完成**：
 - ✅ 同步 Wal 实现（稳定版本）
-- ✅ 异步 AsyncWal 实现（新增）
 - ✅ 并发安全修复（段轮转保护）
-- ✅ 完整测试覆盖（100 tests）
+- ✅ 完整测试覆盖（87 tests）
 
 **后续规划**：
 - 📝 API 文档完善
 - 🚀 性能优化（内存映射、压缩）
 - 🔧 Auto-flush 功能（Batch 模式增强）
+
+## 设计决策 FAQ
+
+### 为什么只提供同步接口？
+
+Easy WAL 选择只提供同步接口，这是基于以下考虑：
+
+1. **主流实践**：RocksDB、LevelDB、SQLite 等主流 WAL 实现都采用同步接口
+2. **简洁可靠**：同步模型更简单，更容易保证数据一致性和正确性
+3. **灵活适配**：同步接口可以轻松适配到任何异步运行时（Tokio、async-std、smol）
+4. **性能本质**：WAL 的性能瓶颈在磁盘 I/O，同步/异步的 CPU 开销差异可以忽略
+
+### 如何在异步环境中使用？
+
+使用异步运行时提供的 `spawn_blocking` 或 `blocking` 包装同步调用即可，如上面的示例所示。这种方式的性能与原生异步实现几乎相同，因为 WAL 操作本身就是 I/O 密集型。
 
 ## 许证
 
