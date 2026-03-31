@@ -33,6 +33,9 @@ pub enum Error {
 
     /// WAL 已关闭
     Closed,
+
+    /// 压缩错误
+    Compression(String),
 }
 
 impl fmt::Display for Error {
@@ -50,6 +53,9 @@ impl fmt::Display for Error {
             }
             Error::Closed => {
                 write!(f, "WAL has been closed")
+            }
+            Error::Compression(msg) => {
+                write!(f, "Compression error: {}", msg)
             }
         }
     }
@@ -92,5 +98,12 @@ mod tests {
         };
         assert!(err.to_string().contains("1024"));
         assert!(err.to_string().contains("CRC check failed"));
+    }
+
+    #[test]
+    fn test_compression_error_display() {
+        let err = Error::Compression("Failed to decompress data".to_string());
+        assert!(err.to_string().contains("Compression error"));
+        assert!(err.to_string().contains("Failed to decompress data"));
     }
 }

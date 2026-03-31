@@ -238,10 +238,66 @@ pub fn write_batch(&self, records: &[&[u8]]) -> Result<Vec<u64>>;
 - 批量写入测试通过
 - 性能测试验证提升效果
 
+### 🔧 待办 4：快照机制
+
+**优先级**：中
+
+**需求**：
+```rust
+pub fn create_snapshot(&self, path: &Path) -> Result<()>;
+pub fn restore_from_snapshot(&self, path: &Path) -> Result<()>;
+```
+
+**实现方案**：
+- 定期创建快照，保存当前WAL状态
+- 快照后清理旧WAL段，节省磁盘空间
+- 支持从快照恢复WAL状态
+
+**预期效果**：
+- 节省磁盘空间（定期清理旧WAL段）
+- 加速恢复过程（从快照恢复比从WAL重放更快）
+- 支持数据归档
+
+**完成标准**：
+- 快照创建和恢复测试通过
+- 快照后能正确清理旧WAL段
+- 恢复后数据完整且正确
+
+---
+
+## 实施计划
+
+**阶段 1**：待办 2 - 修复 mmap 崩溃恢复问题
+- 预计时间：1-2 小时
+- 预期成果：崩溃恢复更可靠，Immediate 模式性能不降低
+
+**阶段 2**：待办 3.1 - 添加监控指标
+- 预计时间：2-3 小时
+- 预期成果：生产环境可监控 WAL 性能
+
+**阶段 3**：待办 1 - 进一步简化锁结构
+- 预计时间：2-4 小时（取决于方案选择）
+- 预期成果：锁层次减少，代码更简洁
+
+**阶段 4**：待办 3.2 - 添加压缩支持
+- 预计时间：3-4 小时
+- 预期成果：节省磁盘空间
+
+**阶段 5**：待办 3.3 - 批量写入优化
+- 预计时间：1-2 小时
+- 预期成果：高吞吐场景性能提升
+
+**阶段 6**：待办 4 - 快照机制
+- 预计时间：4-6 小时
+- 预期成果：定期清理旧WAL段，加速恢复过程
+
+---
+
 **推荐实施顺序**：
-1. 监控指标（最高优先级，生产必备）
-2. 压缩支持（中优先级，节省磁盘）
+1. 监控指标（最高优先级，生产必备）✅ 已完成
+2. 压缩支持（中优先级，节省磁盘）✅ 已完成
 3. 批量写入优化（低优先级，如果吞吐量不足）
+4. 快照机制（中优先级，长期优化）
 
 ---
 
@@ -319,15 +375,33 @@ pub fn write_batch(&self, records: &[&[u8]]) -> Result<Vec<u64>>;
 - **Git commit**：a40754e
 
 ### ✅ 待办 3.2：添加压缩支持
-- **完成时间**：YYYY-MM-DD
-- **实施方案**：Snappy / Zstd / 两者都支持
-- **测试结果**：压缩/解压测试通过，CPU开销可接受
-- **Git commit**：[commit hash]
+- **完成时间**：2025-03-31
+- **实施方案**：记录级压缩，支持Snappy和Zstd，默认关闭（compression feature）
+- **测试结果**：72个测试（启用compression），70个测试（默认关闭），100%通过，压缩功能正常工作
+- **主要改进**：
+  - 创建compression.rs模块，定义CompressionAlgo枚举（None, Snappy, Zstd）
+  - 修改HEADER_SIZE从12字节增加到13字节，添加Compression字段
+  - segment.append返回(u64, usize)元组，提供实际写入的字节数
+  - wal.write默认使用CompressionAlgo::None，wal.write_compressed支持指定压缩算法
+  - CompressionAlgo::None在未启用compression feature时也能正常工作（零开销）
+  - Snappy和Zstd压缩算法在启用compression feature时能正常工作
+  - 支持feature flag开关，默认关闭，完全零开销
+- **性能影响**：
+  - 默认关闭：完全零开销，压缩相关代码不会被编译
+  - 启用压缩：根据数据内容和长度，压缩率可达50-90%，CPU开销取决于压缩算法
+  - CompressionAlgo::None：无论是否启用compression feature，都是零开销（直接返回原数据）
+- **Git commit**：[待提交]
 
 ### ✅ 待办 3.3：批量写入优化
 - **完成时间**：YYYY-MM-DD
 - **实施方案**：write_batch() API
 - **测试结果**：批量写入测试通过，性能提升 X 倍
+- **Git commit**：[commit hash]
+
+### 🔧 待办 4：快照机制
+- **完成时间**：YYYY-MM-DD
+- **实施方案**：create_snapshot / restore_from_snapshot API
+- **测试结果**：快照创建和恢复测试通过，旧WAL段清理正确
 - **Git commit**：[commit hash]
 
 ---

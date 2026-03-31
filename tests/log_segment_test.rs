@@ -2,7 +2,7 @@
 //!
 //! 测试 Easy WAL 的段管理功能
 
-use easy_wal::{Error, LogSegment};
+use easy_wal::{CompressionAlgo, Error, LogSegment};
 
 use tempfile::TempDir;
 
@@ -58,7 +58,7 @@ fn test_append_single_record() {
     let segment = LogSegment::create(&segment_path, 0).unwrap();
 
     let data = b"test data";
-    let offset = segment.append(data).unwrap();
+    let (offset, _) = segment.append(data, CompressionAlgo::None).unwrap();
 
     // 验证返回的 offset 是正确的（应该等于 base_offset）
     assert_eq!(offset, 0);
@@ -79,9 +79,9 @@ fn test_append_multiple_records() {
     let data2 = b"second record";
     let data3 = b"third record";
 
-    let offset1 = segment.append(data1).unwrap();
-    let offset2 = segment.append(data2).unwrap();
-    let offset3 = segment.append(data3).unwrap();
+    let (offset1, _) = segment.append(data1, CompressionAlgo::None).unwrap();
+    let (offset2, _) = segment.append(data2, CompressionAlgo::None).unwrap();
+    let (offset3, _) = segment.append(data3, CompressionAlgo::None).unwrap();
 
     // 验证 offset 递增
     assert!(offset2 > offset1);
@@ -97,7 +97,9 @@ fn test_read_single_record() {
     let segment = LogSegment::create(&segment_path, 0).unwrap();
 
     let original_data = b"test data for reading";
-    let offset = segment.append(original_data).unwrap();
+    let (offset, _) = segment
+        .append(original_data, CompressionAlgo::None)
+        .unwrap();
 
     // 读取刚才写入的数据
     let read_data = segment.read(offset).unwrap();
@@ -121,7 +123,7 @@ fn test_read_multiple_records() {
 
     let mut offsets = vec![];
     for record in &records {
-        let offset = segment.append(record).unwrap();
+        let (offset, _) = segment.append(record, CompressionAlgo::None).unwrap();
         offsets.push(offset);
     }
 
@@ -171,7 +173,7 @@ fn test_append_empty_data() {
     let segment = LogSegment::create(&segment_path, 0).unwrap();
 
     let empty_data = b"";
-    let offset = segment.append(empty_data).unwrap();
+    let (offset, _) = segment.append(empty_data, CompressionAlgo::None).unwrap();
 
     // 空数据也应该能正常写入
     let read_data = segment.read(offset).unwrap();
@@ -187,7 +189,9 @@ fn test_data_integrity_with_crc() {
     let segment = LogSegment::create(&segment_path, 0).unwrap();
 
     let original_data = b"data with crc check";
-    let offset = segment.append(original_data).unwrap();
+    let (offset, _) = segment
+        .append(original_data, CompressionAlgo::None)
+        .unwrap();
 
     // 正常读取应该成功
     let read_data = segment.read(offset).unwrap();
@@ -210,13 +214,13 @@ fn test_segment_size_tracking() {
 
     // 写入数据
     let data = b"test data for size tracking";
-    segment.append(data).unwrap();
+    segment.append(data, CompressionAlgo::None).unwrap();
 
     let new_size = segment.size();
     assert!(new_size > initial_size);
 
     // 写入更多数据
-    segment.append(b"more data").unwrap();
+    segment.append(b"more data", CompressionAlgo::None).unwrap();
     let final_size = segment.size();
 
     assert!(final_size > new_size);

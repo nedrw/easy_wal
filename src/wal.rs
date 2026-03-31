@@ -2,7 +2,9 @@
 //!
 //! 实现 WAL 对象，提供主要的读写接口
 
-use crate::{Config, Error, LogSegment, PersistenceMode, Result, WalStats, stats::Stats};
+use crate::{
+    CompressionAlgo, Config, Error, LogSegment, PersistenceMode, Result, WalStats, stats::Stats,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
@@ -188,6 +190,14 @@ impl Wal {
     ///
     /// # 返回
     /// 成功返回写入的偏移量，失败返回错误
+
+    /// 写入数据
+    ///
+    /// # 参数
+    /// - `data`: 要写入的数据
+    ///
+    /// # 返回
+    /// 成功返回写入的偏移量，失败返回错误
     pub fn write(&self, data: &[u8]) -> Result<u64> {
         // 检查是否已关闭
         if self.closed.load(Ordering::Acquire) {
@@ -196,6 +206,7 @@ impl Wal {
 
         let offset;
         let need_sync;
+        let written_size;
 
         // 使用单一写锁保护所有写入操作
         {
@@ -207,7 +218,7 @@ impl Wal {
                 segment.size()
             };
 
-            let record_size = 12 + data.len() as u64; // header + data
+            let record_size = 13 + data.len() as u64; // header + data
             if segment_size + record_size > self.config.segment_size() as u64 {
                 // 需要轮转到新段
                 let next_offset = inner.next_offset;
@@ -227,13 +238,14 @@ impl Wal {
 
             // 写入数据
             offset = inner.next_offset;
-            let write_offset = {
+            let (write_offset, size) = {
                 let segment = inner.active_segment.write().unwrap();
-                segment.append(data)?
+                segment.append(data, CompressionAlgo::None)?
             };
+            written_size = size;
 
             // 更新下一个偏移量
-            inner.next_offset = write_offset + 12 + data.len() as u64;
+            inner.next_offset = write_offset + written_size as u64;
 
             // 根据持久化模式决定是否同步
             need_sync = self.config.persistence_mode() == PersistenceMode::Immediate;
@@ -247,7 +259,86 @@ impl Wal {
         }
 
         // 统计：记录写入操作
-        self.stats.record_write((12 + data.len()) as u64);
+        self.stats.record_write(written_size as u64);
+
+        Ok(offset)
+    }
+
+    /// 写入压缩数据
+    ///
+    /// # 参数
+    /// - `data`: 要写入的数据
+    /// - `compression`: 压缩算法
+    ///
+    /// # 返回
+    /// 成功返回写入的偏移量，失败返回错误
+    ///
+    /// # 注意
+    /// 需要启用 `compression` feature 才能使用压缩功能
+    pub fn write_compressed(&self, data: &[u8], compression: CompressionAlgo) -> Result<u64> {
+        // 检查是否已关闭
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+
+        let offset;
+        let need_sync;
+        let written_size;
+
+        // 使用单一写锁保护所有写入操作
+        {
+            let mut inner = self.inner.write().unwrap();
+
+            // 检查是否需要轮转
+            let segment_size = {
+                let segment = inner.active_segment.read().unwrap();
+                segment.size()
+            };
+
+            // 计算record_size（使用原始数据大小估算，实际压缩后可能更小）
+            let estimated_record_size = 13 + data.len() as u64;
+
+            if segment_size + estimated_record_size > self.config.segment_size() as u64 {
+                // 需要轮转到新段
+                let next_offset = inner.next_offset;
+                let segment_path = self.path.join(format!("{:020}.log", next_offset));
+
+                // 创建新段
+                let new_segment = LogSegment::create(&segment_path, next_offset)?;
+                let new_segment = Arc::new(RwLock::new(new_segment));
+
+                // 更新活跃段和段集合
+                inner.active_segment = Arc::clone(&new_segment);
+                inner.segments.insert(next_offset, new_segment);
+
+                // 统计：增加段数量
+                self.stats.increment_segment_count();
+            }
+
+            // 写入数据（segment.append会压缩数据）
+            offset = inner.next_offset;
+            let (write_offset, size) = {
+                let segment = inner.active_segment.write().unwrap();
+                segment.append(data, compression)?
+            };
+            written_size = size;
+
+            // 更新下一个偏移量（使用实际写入的字节数）
+            inner.next_offset = write_offset + written_size as u64;
+
+            // 根据持久化模式决定是否同步
+            need_sync = self.config.persistence_mode() == PersistenceMode::Immediate;
+        }
+
+        // 如果需要立即同步，在锁外执行（减少锁持有时间）
+        if need_sync {
+            let inner = self.inner.read().unwrap();
+            let segment = inner.active_segment.read().unwrap();
+            segment.sync()?;
+        }
+
+        // 统计：记录写入操作（使用实际写入的字节数）
+        self.stats.record_write(written_size as u64);
 
         Ok(offset)
     }

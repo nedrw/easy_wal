@@ -13,8 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 魔数，用于验证数据格式
 const MAGIC: u32 = 0x4C4F4753; // "LOGS" in hex
 
-/// 记录头大小：Magic(4) + Length(4) + CRC(4) = 12字节
-const HEADER_SIZE: usize = 12;
+/// 记录头大小：Magic(4) + Length(4) + CRC(4) + Compression(1) = 13字节
+const HEADER_SIZE: usize = 13;
+
+use crate::CompressionAlgo;
 
 /// 默认段大小（预分配大小）
 const DEFAULT_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024; // 1GB
@@ -239,8 +241,11 @@ impl LogSegment {
     ///
     /// # 返回
     /// 成功返回写入的偏移量，失败返回错误
-    pub fn append(&self, data: &[u8]) -> Result<u64> {
-        let record_size = HEADER_SIZE + data.len();
+    pub fn append(&self, data: &[u8], compression: CompressionAlgo) -> Result<(u64, usize)> {
+        // 压缩数据（如果需要）
+        let compressed_data = compression.compress(data)?;
+
+        let record_size = HEADER_SIZE + compressed_data.len();
 
         // 获取当前大小并检查容量
         let offset = self.size.load(Ordering::Acquire);
@@ -251,13 +256,13 @@ impl LogSegment {
             )));
         }
 
-        // 计算 CRC
-        let crc = crc32(data);
+        // 计算 CRC（对压缩后的数据）
+        let crc = crc32(&compressed_data);
 
         // 获取写锁
         let mut mmap = self.mmap.write().unwrap();
 
-        // 写入记录：[Magic][Length][CRC][Data]
+        // 写入记录：[Magic][Length][CRC][Compression][Data]
         let offset_usize = offset as usize;
         let mmap_data = &mut *mmap;
 
@@ -272,22 +277,26 @@ impl LogSegment {
         // 写入 Magic
         mmap_data[offset_usize..offset_usize + 4].copy_from_slice(&MAGIC.to_be_bytes());
 
-        // 写入 Length
-        let length = data.len() as u32;
+        // 写入 Length（压缩后的长度）
+        let length = compressed_data.len() as u32;
         mmap_data[offset_usize + 4..offset_usize + 8].copy_from_slice(&length.to_be_bytes());
 
         // 写入 CRC
         mmap_data[offset_usize + 8..offset_usize + 12].copy_from_slice(&crc.to_be_bytes());
 
-        // 写入 Data
-        mmap_data[offset_usize + 12..offset_usize + record_size].copy_from_slice(data);
+        // 写入 Compression
+        mmap_data[offset_usize + 12] = compression.to_byte();
+
+        // 写入 Data（压缩后的数据）
+        mmap_data[offset_usize + HEADER_SIZE..offset_usize + record_size]
+            .copy_from_slice(&compressed_data);
 
         // 更新大小（原子操作）
         self.size
             .store(offset + record_size as u64, Ordering::Release);
 
-        // 返回绝对偏移量（base_offset + 相对偏移量）
-        Ok(self.base_offset + offset)
+        // 返回绝对偏移量和写入的字节数
+        Ok((self.base_offset + offset, record_size))
     }
 
     /// 刷新数据到磁盘
@@ -374,7 +383,7 @@ impl LogSegment {
             });
         }
 
-        // 读取 Length
+        // 读取 Length（压缩后的长度）
         let length = u32::from_be_bytes([
             mmap_data[offset_usize + 4],
             mmap_data[offset_usize + 5],
@@ -390,6 +399,14 @@ impl LogSegment {
             mmap_data[offset_usize + 11],
         ]);
 
+        // 读取 Compression
+        let compression_byte = mmap_data[offset_usize + 12];
+        let compression =
+            CompressionAlgo::from_byte(compression_byte).ok_or_else(|| Error::Corruption {
+                offset,
+                reason: format!("Invalid compression algorithm: {}", compression_byte),
+            })?;
+
         // 检查是否有完整的数据
         let record_size = HEADER_SIZE + length as usize;
         if offset_usize + record_size > mmap_data.len() {
@@ -399,11 +416,12 @@ impl LogSegment {
             });
         }
 
-        // 读取 Data
-        let data = mmap_data[offset_usize + HEADER_SIZE..offset_usize + record_size].to_vec();
+        // 读取压缩后的数据
+        let compressed_data =
+            mmap_data[offset_usize + HEADER_SIZE..offset_usize + record_size].to_vec();
 
-        // 验证 CRC
-        let actual_crc = crc32(&data);
+        // 验证 CRC（对压缩后的数据）
+        let actual_crc = crc32(&compressed_data);
         if actual_crc != expected_crc {
             return Err(Error::Corruption {
                 offset,
@@ -413,6 +431,9 @@ impl LogSegment {
                 ),
             });
         }
+
+        // 解压数据
+        let data = compression.decompress(&compressed_data)?;
 
         Ok(data)
     }
@@ -485,7 +506,7 @@ mod tests {
 
         // 写入数据
         let data = b"test data";
-        let offset = segment.append(data).unwrap();
+        let (offset, _) = segment.append(data, CompressionAlgo::None).unwrap();
 
         // 读取数据
         let read_data = segment.read(offset).unwrap();
@@ -507,7 +528,7 @@ mod tests {
 
         let mut offsets = vec![];
         for record in &records {
-            let offset = segment.append(record).unwrap();
+            let (offset, _) = segment.append(record, CompressionAlgo::None).unwrap();
             offsets.push(offset);
         }
 
@@ -529,14 +550,14 @@ mod tests {
 
         // 写入数据
         let data = b"test data";
-        segment.append(data).unwrap();
+        segment.append(data, CompressionAlgo::None).unwrap();
 
         // 验证大小增加
         let size1 = segment.size();
         assert!(size1 > 0);
 
         // 写入更多数据
-        segment.append(b"more data").unwrap();
+        segment.append(b"more data", CompressionAlgo::None).unwrap();
         let size2 = segment.size();
         assert!(size2 > size1);
     }
@@ -569,7 +590,7 @@ mod tests {
             .collect();
         let mut offsets = vec![];
         for record in &records {
-            let offset = segment.append(record).unwrap();
+            let (offset, _) = segment.append(record, CompressionAlgo::None).unwrap();
             offsets.push(offset);
         }
 
