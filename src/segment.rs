@@ -37,6 +37,10 @@ pub struct LogSegment {
 
     /// mmap 映射的总容量
     capacity: u64,
+
+    /// 已刷新的偏移量（原子操作，用于精细刷新）
+    /// 记录已经刷新到磁盘的数据位置，避免重复刷新
+    flushed_offset: AtomicU64,
 }
 
 impl LogSegment {
@@ -93,6 +97,7 @@ impl LogSegment {
             mmap: RwLock::new(mmap),
             size: AtomicU64::new(0),
             capacity,
+            flushed_offset: AtomicU64::new(0),
         })
     }
 
@@ -140,6 +145,7 @@ impl LogSegment {
             mmap: RwLock::new(mmap),
             size: AtomicU64::new(size),
             capacity,
+            flushed_offset: AtomicU64::new(0),
         })
     }
 
@@ -286,11 +292,30 @@ impl LogSegment {
 
     /// 刷新数据到磁盘
     ///
+    /// 使用 flush_range 精细刷新，只刷新未刷新的数据区域，而不是整个 mmap
+    /// 通过 flushed_offset 记录已刷新的位置，避免重复刷新
+    ///
     /// # 返回
     /// 成功返回 Ok(())，失败返回错误
     pub fn sync(&self) -> Result<()> {
+        let flushed = self.flushed_offset.load(Ordering::Acquire);
+        let size = self.size.load(Ordering::Acquire);
+
+        // 如果没有数据需要刷新，直接返回
+        if size == 0 || flushed >= size {
+            return Ok(());
+        }
+
         let mmap = self.mmap.read().unwrap();
-        mmap.flush()?;
+
+        // 只刷新未刷新的数据区域（从 flushed 到 size）
+        // 这样可以避免重复刷新已刷新的数据，提高性能
+        let flush_size = size - flushed;
+        mmap.flush_range(flushed as usize, flush_size as usize)?;
+
+        // 更新 flushed_offset，标记这部分数据已刷新
+        self.flushed_offset.store(size, Ordering::Release);
+
         Ok(())
     }
 
