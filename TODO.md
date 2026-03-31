@@ -286,7 +286,7 @@ pub fn write_batch(&self, records: &[&[u8]]) -> Result<Vec<u64>>;
   - 写操作：使用单一写锁，保证正确性和原子性，性能略有下降但可接受
   - 读操作：仍使用读锁，并发读性能保持不变
   - 整体：代码简洁性和正确性优先，性能影响可控
-- **Git commit**：待提交
+- **Git commit**：b8cba36
 
 ### ✅ 待办 2：修复 mmap 崩溃恢复问题
 - **完成时间**：YYYY-MM-DD
