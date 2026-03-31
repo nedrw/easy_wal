@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// WAL 对象
@@ -20,16 +21,16 @@ pub struct Wal {
     config: Config,
 
     /// 所有段的集合（按 base_offset 排序）
-    segments: RwLock<BTreeMap<u64, Arc<Mutex<LogSegment>>>>,
+    segments: RwLock<BTreeMap<u64, Arc<RwLock<LogSegment>>>>,
 
     /// 当前活跃段
-    active_segment: RwLock<Arc<Mutex<LogSegment>>>,
+    active_segment: RwLock<Arc<RwLock<LogSegment>>>,
 
-    /// 下一个写入偏移量
-    next_offset: RwLock<u64>,
+    /// 下一个写入偏移量（原子操作，无锁）
+    next_offset: AtomicU64,
 
-    /// 是否已关闭
-    closed: RwLock<bool>,
+    /// 是否已关闭（原子操作，无锁）
+    closed: AtomicBool,
 
     /// 段轮转保护锁（确保只有一个线程能执行轮转）
     rotate_lock: Mutex<()>,
@@ -40,8 +41,8 @@ impl fmt::Debug for Wal {
         f.debug_struct("Wal")
             .field("path", &self.path)
             .field("config", &self.config)
-            .field("next_offset", &*self.next_offset.read().unwrap())
-            .field("closed", &*self.closed.read().unwrap())
+            .field("next_offset", &self.next_offset.load(Ordering::Acquire))
+            .field("closed", &self.closed.load(Ordering::Acquire))
             .field("segments_count", &self.segments.read().unwrap().len())
             .finish()
     }
@@ -69,7 +70,7 @@ impl Wal {
         let segment_path = path.join("00000000000000000000.log");
         let segment = LogSegment::create(&segment_path, 0)?;
 
-        let active_segment = Arc::new(Mutex::new(segment));
+        let active_segment = Arc::new(RwLock::new(segment));
         let mut segments = BTreeMap::new();
         segments.insert(0, Arc::clone(&active_segment));
 
@@ -78,8 +79,8 @@ impl Wal {
             config,
             segments: RwLock::new(segments),
             active_segment: RwLock::new(active_segment),
-            next_offset: RwLock::new(0),
-            closed: RwLock::new(false),
+            next_offset: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
             rotate_lock: Mutex::new(()),
         };
 
@@ -131,7 +132,7 @@ impl Wal {
                     max_offset = segment_end;
                 }
 
-                segments.insert(base_offset, Arc::new(Mutex::new(segment)));
+                segments.insert(base_offset, Arc::new(RwLock::new(segment)));
             }
         }
 
@@ -139,7 +140,7 @@ impl Wal {
         if segments.is_empty() {
             let segment_path = path.join("00000000000000000000.log");
             let segment = LogSegment::create(&segment_path, 0)?;
-            segments.insert(0, Arc::new(Mutex::new(segment)));
+            segments.insert(0, Arc::new(RwLock::new(segment)));
             max_offset = 0;
         }
 
@@ -151,8 +152,8 @@ impl Wal {
             config,
             segments: RwLock::new(segments),
             active_segment: RwLock::new(active_segment),
-            next_offset: RwLock::new(max_offset),
-            closed: RwLock::new(false),
+            next_offset: AtomicU64::new(max_offset),
+            closed: AtomicBool::new(false),
             rotate_lock: Mutex::new(()),
         };
 
@@ -168,14 +169,14 @@ impl Wal {
     /// 成功返回写入的偏移量，失败返回错误
     pub fn write(&self, data: &[u8]) -> Result<u64> {
         // 检查是否已关闭
-        if *self.closed.read().unwrap() {
+        if self.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
 
         // 检查是否需要轮转（第一次检查）
         {
             let active_segment = self.active_segment.read().unwrap();
-            let segment = active_segment.lock().unwrap();
+            let segment = active_segment.read().unwrap();
             let segment_size = segment.size();
 
             // 检查是否需要轮转
@@ -191,7 +192,7 @@ impl Wal {
                 // 再次检查是否需要轮转（第二次检查，double-check locking）
                 {
                     let active_segment = self.active_segment.read().unwrap();
-                    let segment = active_segment.lock().unwrap();
+                    let segment = active_segment.read().unwrap();
                     let segment_size = segment.size();
 
                     if segment_size + record_size > self.config.segment_size() as u64 {
@@ -208,14 +209,14 @@ impl Wal {
         let offset;
         {
             let active_segment = self.active_segment.read().unwrap();
-            let mut segment = active_segment.lock().unwrap();
-            let mut next_offset = self.next_offset.write().unwrap();
+            let segment = active_segment.write().unwrap();
 
-            offset = *next_offset;
+            offset = self.next_offset.load(Ordering::Acquire);
             let write_offset = segment.append(data)?;
 
-            // 更新下一个偏移量
-            *next_offset = write_offset + 12 + data.len() as u64;
+            // 更新下一个偏移量（原子操作）
+            self.next_offset
+                .store(write_offset + 12 + data.len() as u64, Ordering::Release);
         }
 
         // 根据持久化模式处理
@@ -223,7 +224,7 @@ impl Wal {
             PersistenceMode::Immediate => {
                 // Immediate 模式：立即刷新到磁盘
                 let active_segment = self.active_segment.read().unwrap();
-                let segment = active_segment.lock().unwrap();
+                let segment = active_segment.read().unwrap();
                 segment.sync()?;
             }
             PersistenceMode::Batch | PersistenceMode::Manual => {
@@ -243,7 +244,7 @@ impl Wal {
     /// 成功返回读取的数据，失败返回错误
     pub fn read(&self, offset: u64) -> Result<Vec<u8>> {
         // 检查是否已关闭
-        if *self.closed.read().unwrap() {
+        if self.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
 
@@ -260,20 +261,20 @@ impl Wal {
         drop(segments);
 
         // 从段中读取数据
-        let segment = segment.lock().unwrap();
+        let segment = segment.read().unwrap();
         segment.read(offset)
     }
 
     /// 刷新数据到磁盘
     pub fn flush(&self) -> Result<()> {
         // 检查是否已关闭
-        if *self.closed.read().unwrap() {
+        if self.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
 
         // 刷新当前活跃段到磁盘
         let active_segment = self.active_segment.read().unwrap();
-        let segment = active_segment.lock().unwrap();
+        let segment = active_segment.read().unwrap();
         segment.sync()?;
 
         Ok(())
@@ -281,8 +282,7 @@ impl Wal {
 
     /// 关闭 WAL
     pub fn close(&self) -> Result<()> {
-        let mut closed = self.closed.write().unwrap();
-        *closed = true;
+        self.closed.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -304,14 +304,14 @@ impl Wal {
     /// - 清理后，已删除段的数据将无法访问（返回 SegmentNotFound 错误）
     pub fn prune_segments(&self, retain_min_offset: u64) -> Result<()> {
         // 检查是否已关闭
-        if *self.closed.read().unwrap() {
+        if self.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
 
         // 获取活跃段的base_offset（活跃段不应该被删除）
         let active_base_offset = {
             let active_segment = self.active_segment.read().unwrap();
-            let segment = active_segment.lock().unwrap();
+            let segment = active_segment.read().unwrap();
             segment.base_offset()
         };
 
@@ -369,12 +369,12 @@ impl Wal {
 
     /// 轮转到新段
     fn rotate_segment(&self) -> Result<()> {
-        let next_offset = *self.next_offset.read().unwrap();
+        let next_offset = self.next_offset.load(Ordering::Acquire);
         let segment_path = self.path.join(format!("{:020}.log", next_offset));
 
         // 创建新段
         let new_segment = LogSegment::create(&segment_path, next_offset)?;
-        let new_segment = Arc::new(Mutex::new(new_segment));
+        let new_segment = Arc::new(RwLock::new(new_segment));
 
         // 更新活跃段
         {
