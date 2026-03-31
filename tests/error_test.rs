@@ -2,7 +2,7 @@
 //!
 //! 测试 Easy WAL 的核心错误特性
 
-use easy_wal::{Error, Result};
+use easy_wal::Error;
 use std::io;
 
 #[test]
